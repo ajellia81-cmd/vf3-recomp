@@ -1,0 +1,653 @@
+#include <algorithm>
+// vf3run: the headless runner. Runs the game on the interpreter for a number of frames (or until a script
+// quits), playing an input script, and writes the CPU state and a RAM hash after every frame in the reference
+// build's format, for tools/statecmp.py.
+//   vf3run <vf3.zip> [--frames N] [--script FILE] [--state FILE] [--ram-at FRAME] [--watch ADDR] [--rec] [--quiet]
+// --wav FILE runs the sound board and writes what it plays. --shots DIR writes the script's screenshots there as PNG. --rec runs the recompiled code (src/rec) with the interpreter for the rest. --ram-at writes RAM after that frame to ram_<frame>.bin in the current folder; --watch ADDR (hex) reports
+// the CPU's stores to that word (--trace-pc ADDR: r3-r8 and LR each time that instruction runs; both on the interpreter). VF3_VOLUMES=music,effects (percent) sets the sound board's two volumes for --wav. VF3_POKE=addr=value
+// (hex address into --ram-at's dump, a byte; "b" first: the backup RAM's) writes RAM before every frame
+// (VF3_POKE_FRAMES=from-to: only those). VF3_FREE_PLAY=1: the coin setting FREE PLAY before the boot, as the PC way.
+#include <map>
+#include "../src/host/input_script.h"
+#include "../src/machine/model3.h"
+#include "../src/rec/ppc_rec.h"
+#include "../src/host/png.h"
+#include "../src/video/tilegen.h"
+#include "../src/video/sky_lead.h"
+#include "../src/video/r3d_raster.h"
+#include "../src/sound/soundboard.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+int main(int argc, char **argv)
+{
+	std::string rom, script_path, state_path, shots, wav_path;
+	long frames = -1, ram_at = -1;
+	uint32_t watch = 0xFFFFFFFF, trace_pc = 0xFFFFFFFF;
+	bool quiet = false, rec = false;
+	for (int i = 1; i < argc; i++) {
+		std::string a = argv[i];
+		if (a == "--frames" && i + 1 < argc) frames = strtol(argv[++i], nullptr, 10);
+		else if (a == "--script" && i + 1 < argc) script_path = argv[++i];
+		else if (a == "--state" && i + 1 < argc) state_path = argv[++i];
+		else if (a == "--shots" && i + 1 < argc) shots = argv[++i];
+		else if (a == "--wav" && i + 1 < argc) wav_path = argv[++i];
+		else if (a == "--quiet") quiet = true;
+		else if (a == "--rec") rec = true;
+		else if (a == "--ram-at" && i + 1 < argc) ram_at = strtol(argv[++i], nullptr, 10);
+		else if (a == "--watch" && i + 1 < argc) watch = uint32_t(strtoul(argv[++i], nullptr, 16));
+		else if (a == "--trace-pc" && i + 1 < argc) trace_pc = uint32_t(strtoul(argv[++i], nullptr, 16));
+		else if (a[0] != '-' && rom.empty()) rom = a;
+		else {
+			fprintf(stderr, "vf3run: unknown argument %s\nusage: vf3run <vf3.zip> [--frames N] [--script FILE] [--state FILE] [--quiet]\n", a.c_str());
+			return 2;
+		}
+	}
+	if (rom.empty() || (frames < 0 && script_path.empty())) {
+		fprintf(stderr, "usage: vf3run <vf3.zip> [--frames N] [--script FILE] [--state FILE] [--quiet]\n");
+		return 2;
+	}
+	static m3::Model3 board;
+	std::string error;
+	if (!board.load(rom, error)) {
+		fprintf(stderr, "vf3run: %s\n", error.c_str());
+		return 1;
+	}
+	InputScript script;
+	if (!script_path.empty() && !script.load(script_path, error)) {
+		fprintf(stderr, "vf3run: %s\n", error.c_str());
+		return 1;
+	}
+	FILE *state = nullptr;
+	if (!state_path.empty() && !(state = fopen(state_path.c_str(), "wb"))) {
+		fprintf(stderr, "vf3run: can't write %s\n", state_path.c_str());
+		return 1;
+	}
+	static ppcrec::Rec recompiler;
+	if (rec) {
+		if (watch != 0xFFFFFFFF || trace_pc != 0xFFFFFFFF) {
+			fprintf(stderr, "vf3run: --watch needs the interpreter\n");
+			return 2;
+		}
+		ppcrec::Stats st;
+		if (!recompiler.build(board.cpu, board.program_image(), &st)) {
+			fprintf(stderr, "vf3run: the recompile failed\n");
+			return 1;
+		}
+		board.cpu.rec = &recompiler;
+		if (!quiet)
+			printf("recompiled %zu instructions (%zu native) into %zu KB in %.0f ms\n", st.instructions, st.native,
+			       st.code_bytes / 1024, st.ms);
+	}
+	static video::TileGen tiles;
+	static double tile_ms = 0;
+	static std::vector<uint32_t> picture(video::W * video::H);
+	static video::SceneBuilder scene_builder;
+	if (getenv("VF3_WIDEN")) scene_builder.widen = float(atof(getenv("VF3_WIDEN")));
+	static video::Scene scene;
+	static video::Raster raster;
+	raster.resize(video::W, video::H);
+	if (!shots.empty())
+		board.on_line = [&](unsigned y) {
+			auto a = std::chrono::steady_clock::now();
+			if (y == 0) tiles.clear();
+			tiles.line(board, y);
+			tile_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+		};
+	// VF3_FLICKER=dir: smooth motion's in-between pictures checked (flicker.txt: frame, in between or a cut, pixels
+	// in neither frame), the worst saved (VF3_FLICKER_MIN pixels, 200)
+	const char *flicker_dir = getenv("VF3_FLICKER");
+	FILE *flicker_log = flicker_dir ? fopen((std::string(flicker_dir) + "/flicker.txt").c_str(), "w") : nullptr;
+	if (!flicker_log) flicker_dir = nullptr;
+	const long flicker_save_min = getenv("VF3_FLICKER_MIN") ? atol(getenv("VF3_FLICKER_MIN")) : 200;
+	int flicker_saved = 0;
+	static SoundBoard sound;
+	static std::vector<int16_t> audio;
+	if (!wav_path.empty()) {
+		sound.attach(&board.sound_rom, &board.samples);
+		sound.reset();
+		if (const char *v = getenv("VF3_VOLUMES")) {
+			int m = 100, e = 100;
+			sscanf(v, "%d,%d", &m, &e);
+			sound.set_volumes(m / 100.0f, e / 100.0f);
+		}
+	}
+	board.reset();
+	if (const char *bl = getenv("VF3_BLANK_TEXT")) {   // (tests: "addr:n,..." CROM text, in the PowerPC's byte order, to spaces)
+		unsigned long at = 0, n = 0;
+		for (const char *q = bl; q && sscanf(q, "%lx:%lu", &at, &n) == 2; q = strchr(q, ','), q = q ? q + 1 : nullptr)
+			for (unsigned long k = 0; k < n && ((at + k) ^ 3) < board.crom.size(); k++) board.crom[(at + k) ^ 3] = ' ';
+	}
+	if (getenv("VF3_FREE_PLAY") && board.hide_free_play_text() != 2) fprintf(stderr, "not the data known: the FREE PLAY notices stay\n");
+	if (getenv("VF3_FREE_PLAY")) {   // (tests: the PC way's free play, set as the host does before its boot)
+		for (int i = 0; i < 300 && board.coin_setting() < 0; i++) board.run_frame();
+		if (!board.set_coin_setting(m3::Model3::COIN_FREE_PLAY) && !board.free_play()) fprintf(stderr, "couldn't set FREE PLAY\n");
+		board.reset();
+	}
+	board.cpu.watch = watch & ~3u;
+	board.cpu.trace_pc = trace_pc;
+	auto t0 = std::chrono::steady_clock::now();
+	uint64_t f = 0;
+	for (;; f++) {
+		if (frames >= 0 && f >= uint64_t(frames))
+			break;
+		InputScript::Actions act = script.step(board.controls, f);
+		for (auto &m : act.marks)
+			if (!quiet) printf("frame %llu: mark %s\n", (unsigned long long)f, m.c_str());
+		static double t_board = 0, t_sound = 0, t_scene = 0;
+		static const bool prof = getenv("VF3_PROF") != nullptr;
+		if (static const char *pk = getenv("VF3_POKE"); pk) {   // tests: "addr=value,..." (bytes, as --ram-at's dump holds them) before every frame
+			static const char *range = getenv("VF3_POKE_FRAMES");   // "from-to": only then
+			long from = 0, to = -1;
+			if (range) sscanf(range, "%ld-%ld", &from, &to);
+			unsigned long pa = 0, pv = 0;
+			if (!range || (long(f) >= from && long(f) <= to))
+				for (const char *q = pk; q; q = strchr(q, ','), q = q ? q + 1 : nullptr) {
+					const bool bk = *q == 'b';   // ("b" first: the backup RAM)
+					if (sscanf(q + bk, "%lx=%lu", &pa, &pv) != 2) break;
+					std::vector<uint8_t> &mem = bk ? board.backup : board.ram;
+					if (pa < mem.size()) mem[pa] = uint8_t(pv);
+				}
+		}
+		auto tp0 = std::chrono::steady_clock::now();
+		board.run_frame();
+		auto tp1 = std::chrono::steady_clock::now();
+		t_board += std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+		if (prof) {
+			static video::Scene ps;
+			auto a = std::chrono::steady_clock::now();
+			scene_builder.build(board, ps);
+			t_scene += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+			if (f % 500 == 499) printf("prof %llu: board %.2f ms (tile layers %.2f of it), sound %.2f, scene build %.2f a frame\n", (unsigned long long)f + 1, t_board / 500, tile_ms / 500, t_sound / 500, t_scene / 500), t_board = t_sound = t_scene = tile_ms = 0;
+		}
+		auto ts0 = std::chrono::steady_clock::now();
+		struct SoundTime { std::chrono::steady_clock::time_point t; double &acc; ~SoundTime() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); } } sound_time{ ts0, t_sound };
+		if (!wav_path.empty()) {
+			while (!board.midi.empty()) {
+				if (getenv("VF3_MIDI_LOG")) {
+					static FILE *ml = fopen(getenv("VF3_MIDI_LOG"), "w");
+					fprintf(ml, "%llu %02x\n", (unsigned long long)f, board.midi.front());
+					fflush(ml);
+				}
+				sound.midi_in(board.midi.front());
+				board.midi.pop_front();
+			}
+			sound.run(1.0 / 57.524160, audio);
+			if (getenv("VF3_DUMP_SOUND_RAM") && strstr((std::string(",") + getenv("VF3_DUMP_SOUND_RAM") + ",").c_str(), ("," + std::to_string(f + 1) + ",").c_str()))
+				for (int n = 0; n < 2; n++) {
+					std::vector<uint16_t> r(0x80000);
+					for (uint32_t i = 0; i < r.size(); i++) r[i] = sound.ram_word(n, i);
+					FILE *df = fopen(("sound_ram" + std::to_string(n + 1) + "_" + std::to_string(f + 1) + ".bin").c_str(), "wb");
+					fwrite(r.data(), 2, r.size(), df);
+					fclose(df);
+				}
+			if (getenv("VF3_DUMP_SOUND_RAM") && strstr((std::string(",") + getenv("VF3_DUMP_SOUND_RAM") + ",").c_str(), ("," + std::to_string(f + 1) + ",").c_str())) {
+				FILE *df = fopen(("scsp_regs_" + std::to_string(f + 1) + ".bin").c_str(), "wb");
+				for (int n = 0; n < 2; n++)
+					for (uint32_t i = 0; i < 0x200; i++) { uint16_t v = sound.reg_word(n, i); fwrite(&v, 2, 1, df); }
+				fclose(df);
+			}
+		}
+		static const long flicker_from = getenv("VF3_FLICKER_FROM") ? atol(getenv("VF3_FLICKER_FROM")) : 0;   // (tests: checked from this frame)
+		if (flicker_dir && long(f) >= flicker_from) {   // VF3_FLICKER: the in-between pictures (t = 0.5) against the frames either side
+			static video::Scene sc[2], mid;
+			static std::vector<uint32_t> pf[2], pm;
+			static int cur = 0;
+			static bool have = false;
+			auto shoot = [&](const video::Scene &s, std::vector<uint32_t> &o) {
+				raster.render(s, board.tex_ram.data());
+				o.assign(size_t(video::W) * video::H, 0xFF000000u);
+				raster.compose(o.data(), o.data());
+			};
+			cur ^= 1;
+			scene_builder.build(board, sc[cur]);
+			static const bool mids_only = getenv("VF3_MIDS_ONLY") != nullptr;   // (just VF3_MIDS' pictures)
+			if (!mids_only) shoot(sc[cur], pf[cur]);
+			// VF3_MIDS=f,f,...: at those frames the in-between picture (t = 0.5) and the frame, at 2x, cropped to the 3D's
+			// middle (mid_<f>.png): the fighters' joints between frames, by eye
+			if (have && getenv("VF3_MIDS") && strstr((std::string(",") + getenv("VF3_MIDS") + ",").c_str(), ("," + std::to_string(f) + ",").c_str())) {
+				static video::Raster two;
+				two.resize(video::W * 2, video::H * 2);
+				video::Scene half;
+				video::interpolate(sc[cur ^ 1], sc[cur], 0.5f, half);
+				std::vector<uint32_t> both(size_t(two.width()) * 2 * two.height());
+				for (int k = 0; k < 2; k++) {
+					two.render(k ? sc[cur] : half, board.tex_ram.data());
+					std::vector<uint32_t> o(size_t(two.width()) * two.height(), 0xFF404040u);
+					two.compose(o.data(), o.data());
+					for (int y = 0; y < two.height(); y++)
+						memcpy(&both[size_t(y) * two.width() * 2 + (k ? two.width() : 0)], &o[size_t(y) * two.width()], size_t(two.width()) * 4);
+				}
+				write_png((std::string(flicker_dir) + "/mid_" + std::to_string(f) + ".png").c_str(), both.data(), two.width() * 2, two.height());
+			}
+			// VF3_SEQ=from,to (tests, with VF3_FLICKER's folder): each frame and the in-between before it (t = 0.5), as smooth
+			// motion shows them in turn: seq_<f>_0.png (between), seq_<f>_1.png (the frame)
+			if (const char *sq = getenv("VF3_SEQ"); sq && have && flicker_dir) {
+				long a = 0, b = 0;
+				sscanf(sq, "%ld,%ld", &a, &b);
+				if (long(f) >= a && long(f) <= b) {
+					video::Scene half;
+					video::interpolate(sc[cur ^ 1], sc[cur], getenv("VF3_MID_T") ? float(atof(getenv("VF3_MID_T"))) : 0.5f, half);
+					std::vector<uint32_t> o;
+					shoot(half, o);
+					write_png((std::string(flicker_dir) + "/seq_" + std::to_string(f) + "_0.png").c_str(), o.data(), video::W, video::H);
+					write_png((std::string(flicker_dir) + "/seq_" + std::to_string(f) + "_1.png").c_str(), pf[cur].data(), video::W, video::H);
+				}
+			}
+			static const long gaps_at = getenv("VF3_GAPS") ? atol(getenv("VF3_GAPS")) : -1;
+			if (have && gaps_at >= 0 && long(f) >= gaps_at && long(f) < gaps_at + 4) {
+				static video::Raster big;
+				big.resize(video::W * 3, video::H * 3);
+				auto shoot3 = [&](const video::Scene &s, const char *tag) {
+					big.render(s, board.tex_ram.data());
+					std::vector<uint32_t> o(size_t(big.width()) * big.height(), 0xFF404040u);
+					big.compose(o.data(), o.data());
+					write_png((std::string(flicker_dir) + "/gap_" + std::to_string(f) + tag + ".png").c_str(), o.data(), big.width(), big.height());
+				};
+				video::Scene half;
+				video::InterpStats is;
+				video::interpolate(sc[cur ^ 1], sc[cur], 0.5f, half, &is);
+				shoot3(sc[cur], "_frame");
+				shoot3(half, "_mid");
+				fprintf(stderr, "gaps %llu: turned %zu moved %zu nokey %zu of %zu\n", (unsigned long long)f, is.turned, is.moved, is.no_key, is.total);
+			}
+			if (have && !mids_only) {
+				video::InterpStats ist;
+				static const float mid_t = getenv("VF3_MID_T") ? float(atof(getenv("VF3_MID_T"))) : 0.5f;   // (tests: another in-between)
+				const auto ti0 = std::chrono::steady_clock::now();
+				const bool between = video::interpolate(sc[cur ^ 1], sc[cur], mid_t, mid, &ist);
+				{
+					static double tot = 0, worst = 0; static long n = 0;
+					const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ti0).count();
+					tot += ms; worst = std::max(worst, ms); n++;
+					if (getenv("VF3_INTERP_TIME") && n % 100 == 0) fprintf(stderr, "interpolate: %ld calls, %.3f ms each, worst %.3f\n", n, tot / n, worst);
+				}
+				{
+					const video::Scene &A = sc[cur ^ 1], &B = sc[cur];
+					auto miss = [&](auto key) {
+						std::map<uint64_t, int> ka;
+						for (size_t v = 0; v < A.viewports.size(); v++) for (auto &m : A.viewports[v].models) ka[key(v, m)]++;
+						int n = 0;
+						for (size_t v = 0; v < B.viewports.size(); v++) for (auto &m : B.viewports[v].models) { auto it = ka.find(key(v, m)); if (it == ka.end() || it->second == 0) n++; else it->second--; }
+						return n;
+					};
+					int m_addr = miss([](size_t v, const video::Model &m) { return (uint64_t(v) << 56) ^ m.addr; });
+					int m_path = miss([](size_t v, const video::Model &m) { return (uint64_t(v) << 56) ^ m.node_path; });
+					int dyn = 0;
+					for (auto &vp : B.viewports) for (auto &m : vp.models) dyn += m.addr < 0x100000;
+					fprintf(flicker_log, "alt %llu addr-only-miss %d path-only-miss %d dynamic %d\n", (unsigned long long)f, m_addr, m_path, dyn);
+				}
+				fprintf(flicker_log, "stats %llu total %zu nokey %zu turned %zu moved %zu matched %zu blended %zu not_blended %zu\n", (unsigned long long)f, ist.total, ist.no_key, ist.turned, ist.moved, ist.matched, ist.blended, ist.not_blended);
+				shoot(mid, pm);
+				auto diff = [](uint32_t a, uint32_t b) {
+					int d = 0;
+					for (int sh = 0; sh < 24; sh += 8) d = std::max(d, std::abs(int((a >> sh) & 255) - int((b >> sh) & 255)));
+					return d;
+				};
+				// pixels the in-between has that neither frame has (the two frames agreeing there)
+				long n = 0;
+				const std::vector<uint32_t> &a = pf[cur ^ 1], &b = pf[cur];
+				for (size_t i = 0; i < pm.size(); i++)
+					if (diff(pm[i], a[i]) > 48 && diff(pm[i], b[i]) > 48 && (getenv("VF3_FLICKER_ANY") || diff(a[i], b[i]) <= 16)) n++;
+				// models sharing a key (viewport, nodes, address), paired in order: how many have a nearer one
+				long dups = 0, wrong = 0;
+				{
+					const video::Scene &A = sc[cur ^ 1], &B = sc[cur];
+					std::map<uint64_t, std::vector<const video::Model *>> ka, kb;
+					for (size_t v = 0; v < A.viewports.size(); v++) for (auto &m : A.viewports[v].models) ka[(uint64_t(v) << 56) ^ (uint64_t(m.node_path) << 24) ^ m.addr].push_back(&m);
+					for (size_t v = 0; v < B.viewports.size(); v++) for (auto &m : B.viewports[v].models) kb[(uint64_t(v) << 56) ^ (uint64_t(m.node_path) << 24) ^ m.addr].push_back(&m);
+					auto d2 = [](const video::Model *x, const video::Model *y) { float d = 0; for (int r = 0; r < 3; r++) { float t = x->matrix.m[12 + r] - y->matrix.m[12 + r]; d += t * t; } return d; };
+					for (auto &[k, bs] : kb) {
+						auto it = ka.find(k);
+						if (it == ka.end() || bs.size() < 2) continue;
+						for (size_t i = 0; i < bs.size() && i < it->second.size(); i++) {
+							dups++;
+							float best = 1e30f;
+							for (auto *q : it->second) best = std::min(best, d2(bs[i], q));
+							if (d2(bs[i], it->second[i]) > 4 * best + 1) wrong++;
+						}
+					}
+				}
+				fprintf(flicker_log, "%llu %d %ld %ld %ld\n", (unsigned long long)f, between ? 1 : 0, n, dups, wrong);
+				if (n > flicker_save_min && flicker_saved < 40) {
+					flicker_saved++;
+					const std::string base = std::string(flicker_dir) + "/f" + std::to_string(f);
+					write_png((base + "_a.png").c_str(), a.data(), video::W, video::H);
+					write_png((base + "_m.png").c_str(), pm.data(), video::W, video::H);
+					write_png((base + "_b.png").c_str(), b.data(), video::W, video::H);
+				}
+			}
+			have = true;
+		}
+		if (getenv("VF3_PANO") && long(board.frame) == atol(getenv("VF3_PANO"))) {   // (tests: the stage's backdrop map, as the game keeps it)
+			const uint32_t r13 = board.cpu.s.r[13];
+			const int stage = int16_t(board.peek16(r13 - 0x1e0c));
+			const uint32_t desc = stage >= 0 ? board.peek32(0xFFB30004 + 4 * stage) : 0;
+			const int w = board.peek16(desc + 4), h = board.peek16(desc + 6);
+			fprintf(stderr, "pano r13 %08x stage %d desc %08x w %d h %d\n", r13, stage, desc, w, h);
+			auto entry = [&](int x, int y) {
+				const uint16_t e = board.peek16(desc + 8 + 2 * uint32_t(std::clamp(y, 0, h - 1) * w + ((x % w) + w) % w));
+				return int((e & 0x7F) + int16_t(board.peek16(0x161614 + ((e >> 6) & 0xFE))));
+			};
+			const uint32_t *vr = reinterpret_cast<const uint32_t *>(board.tile_ram.data()) + (0xF8000 + 3 * 0x2000) / 4;
+			int tm[4][64];
+			for (int r = 0; r < 4; r++)
+				for (int c = 0; c < 64; c++) { const uint32_t wd = vr[(r + 8) * 32 + c / 2]; tm[r][c] = int(((c & 1) ? wd & 0xFFFF : wd >> 16) & 0x3FFF); }
+			if (const char *pr = getenv("VF3_PANO_ROWS")) {   // (tests: "x0,y0": each layer row's tiles unlike the map there)
+				int x0, y0;
+				sscanf(pr, "%d,%d", &x0, &y0);
+				for (int lrow = 0; lrow < 64; lrow++) {
+					int bad = 0, first = -1;
+					for (int c = 0; c < 64; c++) {
+						const uint32_t wd = vr[lrow * 32 + c / 2];
+						const int t = int(((c & 1) ? wd & 0xFFFF : wd >> 16) & 0x3FFF);
+						if ((entry(x0 + c, y0 + lrow) & 0x3FFF) != t) { bad++; if (first < 0) first = c; }
+					}
+					fprintf(stderr, "prow %d bad %d first %d\n", lrow, bad, first);
+					if (bad > 32 && getenv("VF3_PANO_ROWX"))   // (where along the map this row is, if anywhere)
+						for (int y = -1; y <= h; y++)
+							for (int x = 0; x < w; x++) {
+								int b2 = 0;
+								for (int c = 0; c < 64 && b2 < 8; c++) {
+									const uint32_t wd = vr[lrow * 32 + c / 2];
+									b2 += (entry(x + c, y) & 0x3FFF) != int(((c & 1) ? wd & 0xFFFF : wd >> 16) & 0x3FFF);
+								}
+								if (b2 < 8) fprintf(stderr, "   row %d at map %d,%d (%d bad)\n", lrow, x, y, b2);
+							}
+				}
+			}
+			if (const char *rr = getenv("VF3_PANO_ROW")) {   // (tests: a map row against a layer row, x0, y0 given)
+				int lrow, x0, y0;
+				sscanf(rr, "%d,%d,%d", &lrow, &x0, &y0);
+				for (int c = 0; c < 64; c++) {
+					const uint32_t wd = vr[lrow * 32 + c / 2];
+					const uint16_t e = board.peek16(desc + 8 + 2 * uint32_t((y0 + lrow) * w + ((x0 + c) % w)));
+					fprintf(stderr, "c%d map e%04x(b%d i%d)=%04x tile %04x\n", c, e, (e >> 7) & 0x7F, e & 0x7F, entry(x0 + c, y0 + lrow) & 0x3FFF, ((c & 1) ? wd & 0xFFFF : wd >> 16) & 0x3FFF);
+				}
+				for (int i = 0; i < 40; i++) fprintf(stderr, "bank %d %04x\n", i, board.peek16(0x161614 + 2 * i));
+			}
+			if (getenv("VF3_PANO_ALL"))   // (tests: every stage's map looked through for the layer's rows)
+				for (int st = 0; st < 96; st++) {
+					const uint32_t d2 = board.peek32(0xFFB30004 + 4 * st);
+					if (d2 < 0xFF000000u) continue;
+					const int w2 = board.peek16(d2 + 4), h2 = board.peek16(d2 + 6);
+					if (w2 < 32 || w2 > 2048 || h2 < 1 || h2 > 256) continue;
+					for (int y = 0; y < h2; y++)
+						for (int x = 0; x < w2; x++) {
+							int ok = 0;
+							for (int c = 0; c < 60; c += 4) {
+								const uint16_t e = board.peek16(d2 + 8 + 2 * uint32_t(y * w2 + (x + c) % w2));
+								ok += ((e & 0x7F) + board.peek16(0x161614 + ((e >> 6) & 0xFE)) & 0x3FFF) == tm[0][c];
+							}
+							if (ok >= 13) fprintf(stderr, "pano-all stage %d desc %08x %dx%d row %d col %d: %d/15\n", st, d2, w2, h2, y, x, ok);
+						}
+				}
+			for (int y = -2; y < h + 2; y++)
+				for (int x = 0; x < w; x++) {
+					int ok = 0;
+					for (int c = 0; c < 60; c++) ok += entry(x + c, y) == tm[0][c];
+					if (ok >= 55) {
+						int ok2 = 0;
+						for (int r = 1; r < 4; r++) for (int c = 0; c < 60; c++) ok2 += entry(x + c, y + r) == tm[r][c];
+						fprintf(stderr, "pano match map row %d (tilemap row 8) col %d: %d/60, next rows %d/180\n", y, x, ok, ok2);
+					}
+				}
+		}
+		if (getenv("VF3_SKY_AUDIT") && !shots.empty())   // (tests: the widescreen backdrop's state each frame)
+		{
+			static long r0, f0, b0, n0;
+			fprintf(stderr, "sky %llu %s rows %ld refind %ld bad %ld nomap %ld\n", (unsigned long long)board.frame, tiles.audit(board).c_str(),
+			        tiles.sky_rows - r0, tiles.sky_refinds - f0, tiles.sky_bad_rows - b0, tiles.sky_nomap_rows - n0);
+			r0 = tiles.sky_rows; f0 = tiles.sky_refinds; b0 = tiles.sky_bad_rows; n0 = tiles.sky_nomap_rows;
+		}
+		if (getenv("VF3_MEMLOG") && board.frame % 30 == 0) {   // (tests: the widescreen sides' share drawn from what was seen)
+			static long d0 = 0, s0 = 0;
+			fprintf(stderr, "mem %llu %.2f\n", (unsigned long long)board.frame, tiles.mem_sides > s0 ? double(tiles.mem_drawn - d0) / double(tiles.mem_sides - s0) : -1.0);
+			d0 = tiles.mem_drawn; s0 = tiles.mem_sides;
+		}
+		if (getenv("VF3_BGSCROLL") && !shots.empty()) {   // the layer below the 3D's move each frame (smooth motion's)
+			static video::TileGen::Scroll before;
+			static std::vector<uint32_t> before_px, now_px, a_px;
+			tiles.aligned(now_px, a_px);
+			float dx, dy;
+			const bool ok = video::TileGen::scrolled(before, tiles.scroll, before_px, now_px, dx, dy);
+			before_px = now_px;
+			// and the camera's turn (the 3D's full-screen viewport): yaw and pitch, in pixels at its focal length
+			static video::Scene sc_before, sc_now;
+			scene_builder.build(board, sc_now);
+			float yaw_px = 0, pitch_px = 0;
+			int cam = 0;
+			for (size_t v = 0; v < sc_now.viewports.size() && v < sc_before.viewports.size(); v++) {
+				const auto &vb = sc_now.viewports[v];
+				if (!vb.full_screen || vb.models.size() < 8) continue;
+				video::Mat4 c;
+				if (!video::camera_move(sc_before.viewports[v], vb, c)) continue;
+				const float fx = video::W / (vb.right - vb.left), fy = video::H / (vb.top - vb.bottom);
+				yaw_px = fx * std::atan2(c.m[8], c.m[0]);
+				pitch_px = fy * std::atan2(-c.m[9], c.m[10]);
+				cam = 1;
+				const auto &va = sc_before.viewports[v];
+				if (va.root_matrix >= 0 && va.root_matrix == vb.root_matrix) {
+					video::Mat4 inv = video::Mat4::identity();
+					// (the root's rotation only: its delta, b times a's transpose)
+					video::Mat4 ra = va.root;
+					for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) inv.m[j * 4 + i] = ra.m[i * 4 + j];
+					const video::Mat4 d = vb.root * inv;
+					printf("root %llu %d %.2f %.2f\n", (unsigned long long)f, vb.root_matrix, fx * std::atan2(d.m[8], d.m[0]), fy * std::atan2(-d.m[9], d.m[10]));
+				}
+				break;
+			}
+			// the sky's lead (sky_lead.h): the backdrop's move with it, against the camera's turn the same frame
+			static video::SkyLead lead;
+			const float before_x = lead.at_x(1), before_y = lead.at_y(1);
+			lead.frame(sc_before, sc_now, ok, dx, dy);
+			float tx = 0, ty = 0;
+			const bool tk = video::SkyLead::turn(sc_before, sc_now, tx, ty);
+			sc_before = sc_now;
+			printf("bg %llu %d %.2f %.2f cam %d %.2f %.2f lead %.2f %.2f trust %.2f moved %.2f %.2f turn %d %.2f %.2f delay %d\n", (unsigned long long)f, ok ? 1 : 0, dx, dy, cam, yaw_px,
+				pitch_px, lead.at_x(1), lead.at_y(1), lead.trust, dx + lead.at_x(1) - before_x, dy + lead.at_y(1) - before_y, tk ? 1 : 0, tx, ty, video::SkyLead::DELAY);
+			if (getenv("VF3_BGLINES") && long(f) >= atol(getenv("VF3_BGLINES")) && long(f) < atol(getenv("VF3_BGLINES")) + 4) {
+				int layer = 0;
+				for (int k = 1; k < 4; k++) if (tiles.scroll.below_columns[k] > tiles.scroll.below_columns[layer]) layer = k;
+				printf("  layer %d:", layer);
+				for (int y = 0; y < video::H; y++) if (y == 0 || tiles.scroll.sx[layer][y] != tiles.scroll.sx[layer][y - 1] || tiles.scroll.sy[layer][y] != tiles.scroll.sy[layer][y - 1]) printf(" y%d=(%d,%d)", y, tiles.scroll.sx[layer][y], tiles.scroll.sy[layer][y]);
+				printf("\n");
+			}
+			before = tiles.scroll;
+		}
+		if (getenv("VF3_COVER") && !shots.empty() && f % 10 == 0) {   // the 2D over the 3D: its share, but for full rows
+			static std::vector<uint32_t> b, a;
+			tiles.aligned(b, a);
+			long n = 0, rows = 0;
+			for (int y = 0; y < video::H; y++) {
+				int c = 0;
+				for (int x = 0; x < video::W; x++) c += (a[size_t(y) * video::W + x] >> 24) != 0;
+				if (c == video::W) continue;
+				rows++;
+				n += c;
+			}
+			printf("cover %llu %.1f%%\n", (unsigned long long)f, rows ? 100.0 * n / (rows * video::W) : 100.0);
+		}
+		if (getenv("VF3_LETTERBOX") && !shots.empty() && f % 10 == 0) {   // frames with full-width bands over the 3D
+			static std::vector<uint32_t> b, a;
+			tiles.aligned(b, a);
+			int rows = 0;
+			for (int y = 0; y < video::H; y++) {
+				bool across = true;
+				for (int x = 0; x < video::W && across; x++) across = (a[size_t(y) * video::W + x] >> 24) != 0;
+				rows += across;
+			}
+			if (rows >= 20 && rows < 300) printf("letterbox %llu rows %d\n", (unsigned long long)f, rows);
+		}
+		if (getenv("VF3_2DFLICK") && !shots.empty()) {   // the 2D: pixels that change for one frame and change back
+			static std::vector<uint32_t> p1, p2, b, a, cur;
+			tiles.aligned(b, a);
+			cur.assign(b.size(), 0);
+			for (size_t i = 0; i < cur.size(); i++) cur[i] = (a[i] >> 24) ? a[i] : (b[i] >> 24) ? b[i] : 0xFF000000u;
+			if (p2.size() == cur.size()) {
+				long n = 0;
+				for (size_t i = 0; i < cur.size(); i++) n += p1[i] != p2[i] && p1[i] != cur[i] && p2[i] == cur[i];
+				if (n > 20) {
+					printf("2dflick %llu %ld\n", (unsigned long long)f - 1, n);
+					static int saved = 0;
+					if (f > 1400 && saved++ < 12) {
+						char pth[64];
+						snprintf(pth, sizeof(pth), "/flick_%06llu.png", (unsigned long long)f - 1);
+						write_png((shots + pth).c_str(), p1.data(), video::W, video::H);
+						snprintf(pth, sizeof(pth), "/flick_%06llu_before.png", (unsigned long long)f - 1);
+						write_png((shots + pth).c_str(), p2.data(), video::W, video::H);
+					}
+				}
+			}
+			p2 = p1; p1 = cur;
+		}
+		if (state) {
+			uint32_t s[128];
+			board.cpu.dump_state(s);
+			uint64_t h = board.ram_hash();
+			s[114] = uint32_t(h >> 32);
+			s[115] = uint32_t(h);
+			s[116] = uint32_t(board.frame);
+			fwrite(s, 4, 128, state);
+		}
+		if (!shots.empty())
+			for (auto &name : act.shots) {
+				scene_builder.build(board, scene);
+				if (getenv("VF3_VP"))
+					for (auto &v : scene.viewports) {
+						printf("frame %llu vp pri %d  %.0f %.0f %.0f %.0f full %d models %zu fog %.2f %.2f %.2f dens %g start %.3f amb %.3f att %.3f ambient %.3f sun %.3f\n", (unsigned long long)board.frame, v.priority, v.vp_x, v.vp_y, v.vp_w, v.vp_h, v.full_screen, v.models.size(),
+							v.fog_colour[0], v.fog_colour[1], v.fog_colour[2], v.fog_density, v.fog_start, v.fog_ambient, v.fog_attenuation, v.ambient, v.sun_intensity);
+						printf("  spot colour %.3f %.3f %.3f ellipse %.1f %.1f %.1f %.1f range %g %g\n", v.spot_colour[0], v.spot_colour[1], v.spot_colour[2],
+							v.spot_ellipse[0], v.spot_ellipse[1], v.spot_ellipse[2], v.spot_ellipse[3], v.spot_range[0], v.spot_range[1]);
+					}
+				raster.render(scene, board.tex_ram.data());
+				static std::vector<uint32_t> below, above;
+				tiles.aligned(below, above);
+				if (getenv("VF3_VP")) {
+					for (int x : { 0, video::W - 3 }) {
+						int a = 0, b = 0;
+						std::string band;
+						for (int y = 0; y < video::H - 2; y++) {
+							bool oa = above[size_t(y) * video::W + x] >> 24, ob = below[size_t(y) * video::W + x] >> 24;
+							a += oa; b += ob;
+							if (y % 8 == 0) band += oa ? 'A' : ob ? 'b' : '.';
+						}
+						printf("frame %llu col %d above %d below %d  %s\n", (unsigned long long)board.frame, x, a, b, band.c_str());
+					}
+				}
+				for (int i = 0; i < video::W * video::H; i++)
+					picture[i] = (below[i] >> 24) ? below[i] : 0xFF000000u;
+				raster.compose(picture.data(), picture.data());
+				for (int i = 0; i < video::W * video::H; i++)
+					if (above[i] >> 24) picture[i] = above[i];
+				char p[64];
+				snprintf(p, sizeof(p), "/shot_%06llu_%s.png", (unsigned long long)board.frame, name.c_str());
+				write_png((shots + p).c_str(), picture.data(), video::W, video::H);
+				if (getenv("VF3_VP")) {
+					const uint32_t *vram = reinterpret_cast<const uint32_t *>(board.tile_ram.data());
+					for (int L = 0; L < 4; L++) {
+						uint32_t r = board.tile_regs[0x60 / 4 + L];
+						printf("frame %llu layer %d on %d reg %08x below %d linescroll %d sx0 %d sx200 %d\n", (unsigned long long)board.frame, L, int(r >> 31), r,
+							!((board.tile_regs[0x20 / 4] >> (8 + L)) & 1), int((r & 0x8000) != 0),
+							int((vram[(0xF6000 + L * 0x400) / 4] >> 16) & 0xFFFF), int((vram[(0xF6000 + L * 0x400) / 4 + 100] >> 16) & 0xFFFF));
+					}
+					for (int y : { 0, 50, 100, 150, 200, 300 }) printf("  mask y%d %08x\n", y, vram[0xF7000 / 4 + y]);
+					for (int row : { 0, 5, 10, 20, 30 }) {
+						printf("  names row %d:", row);
+						const uint32_t *nm = vram + (0xF8000 + 3 * 0x2000) / 4;
+						for (int c = 0; c < 64; c++) { uint32_t pw = nm[row * 32 + c / 2]; printf(" %04x", (c & 1) ? pw & 0xFFFF : pw >> 16); }
+						printf("\n");
+					}
+					snprintf(p, sizeof(p), "/below_%06llu_%s.png", (unsigned long long)board.frame, name.c_str());
+					std::vector<uint32_t> bl(below);
+					for (auto &v : bl) v |= 0xFF000000u;
+					write_png((shots + p).c_str(), bl.data(), video::W, video::H);
+				}
+				if (const char *bs = getenv("VF3_BIGSHOT")) {   // the 3D alone at that scale, over grey (holes show), big_<frame>.png
+					static video::Raster big;
+					const int k = std::clamp(atoi(bs), 1, 8);
+					big.resize(video::W * k, video::H * k);
+					big.render(scene, board.tex_ram.data());
+					std::vector<uint32_t> o(size_t(big.width()) * big.height(), 0xFF808080u);
+					big.compose(o.data(), o.data());
+					char p[64];
+					snprintf(p, sizeof(p), "/big_%06llu_%s.png", (unsigned long long)board.frame, name.c_str());
+					write_png((shots + p).c_str(), o.data(), big.width(), big.height());
+				}
+				if (getenv("VF3_WIDESHOT")) {   // the layer below the 3D widened (as widescreen's sides show it), the screen's edges marked
+					char p[64];
+					snprintf(p, sizeof(p), "/wide_%06llu_%s.png", (unsigned long long)board.frame, name.c_str());
+					std::vector<uint32_t> wd;
+					tiles.aligned_wide(wd);
+					for (auto &v : wd) v |= 0xFF000000u;
+					for (int y = 0; y < video::H; y += 4) wd[size_t(y) * video::WW + video::EXT] = wd[size_t(y) * video::WW + video::EXT + video::W - 1] = 0xFF0000FFu;
+					write_png((shots + p).c_str(), wd.data(), video::WW, video::H);
+				}
+			}
+		if (getenv("VF3_NVDUMP") && strstr((std::string(",") + getenv("VF3_NVDUMP") + ",").c_str(), ("," + std::to_string(board.frame) + ",").c_str())) {
+			// the backup RAM and the EEPROM, to nv_<frame>.bin (backup then EEPROM)
+			if (FILE *nf = fopen(("nv_" + std::to_string(board.frame) + ".bin").c_str(), "wb")) {
+				fwrite(board.backup.data(), 1, board.backup.size(), nf);
+				fwrite(board.eeprom.regs, 1, sizeof(board.eeprom.regs), nf);
+				fclose(nf);
+			}
+		}
+		if (getenv("VF3_TILEDUMP") && strstr((std::string(",") + getenv("VF3_TILEDUMP") + ",").c_str(), ("," + std::to_string(board.frame) + ",").c_str())) {
+			// the tile generator's RAM then its registers, to tile_<frame>.bin
+			if (FILE *tf = fopen(("tile_" + std::to_string(board.frame) + ".bin").c_str(), "wb")) {
+				fwrite(board.tile_ram.data(), 1, board.tile_ram.size(), tf);
+				fwrite(board.tile_regs, 4, 64, tf);
+				fclose(tf);
+			}
+		}
+		if (getenv("VF3_TEXDUMP") && long(board.frame) == atol(getenv("VF3_TEXDUMP"))) {   // texture RAM's first sheet as 16-bit ARGB1555
+			std::vector<uint32_t> px(2048 * 1024);
+			for (int i = 0; i < 2048 * 1024; i++) {
+				const uint16_t t = board.tex_ram[i];
+				const uint32_t r = (t >> 10) & 31, g = (t >> 5) & 31, b = t & 31;
+				px[i] = 0xFF000000u | (b * 255 / 31) << 16 | (g * 255 / 31) << 8 | (r * 255 / 31);
+			}
+			write_png("texram.png", px.data(), 2048, 1024);
+		}
+		if (long(board.frame) == ram_at) {
+			std::string p = "ram_" + std::to_string(board.frame) + ".bin";
+			if (FILE *rf = fopen(p.c_str(), "wb")) { fwrite(board.ram.data(), 1, board.ram.size(), rf); fclose(rf); }
+		}
+		if (board.cpu.s.fatal) {
+			fprintf(stderr, "vf3run: frame %llu: CPU stopped: %s\n", (unsigned long long)board.frame, board.cpu.fatal_message);
+			break;
+		}
+		if (act.quit) {
+			f++;
+			break;
+		}
+	}
+	if (state)
+		fclose(state);
+	if (!wav_path.empty()) {
+		if (FILE *wf = fopen(wav_path.c_str(), "wb")) {
+			auto le32 = [&](uint32_t v) { fwrite(&v, 4, 1, wf); };
+			auto le16 = [&](uint16_t v) { fwrite(&v, 2, 1, wf); };
+			uint32_t bytes = uint32_t(audio.size() * 2);
+			fwrite("RIFF", 1, 4, wf); le32(36 + bytes); fwrite("WAVEfmt ", 1, 8, wf);
+			le32(16); le16(1); le16(2); le32(44100); le32(44100 * 4); le16(4); le16(16);
+			fwrite("data", 1, 4, wf); le32(bytes);
+			fwrite(audio.data(), 2, audio.size(), wf);
+			fclose(wf);
+		}
+	}
+	double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	if (!quiet)
+		printf("%llu frames in %.1f s (%.0f frames a second)\n", (unsigned long long)board.frame, secs, board.frame / secs);
+	if (rec && !quiet) {
+		printf("interpreter instead: %llu before the boot copy, %llu outside the program, %llu without code",
+		       (unsigned long long)recompiler.interp_disabled, (unsigned long long)recompiler.interp_outside,
+		       (unsigned long long)recompiler.interp_unmapped);
+		for (size_t i = 0; i < recompiler.unmapped.size() && i < 8; i++) printf(i ? " %05X" : " (%05X", recompiler.unmapped[i]);
+		printf(recompiler.unmapped.empty() ? "\n" : ")\n");
+	}
+	return board.cpu.s.fatal ? 1 : 0;
+}

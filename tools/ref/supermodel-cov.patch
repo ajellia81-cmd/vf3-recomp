@@ -1,0 +1,1187 @@
+diff --git a/Makefiles/Rules.inc b/Makefiles/Rules.inc
+index 0b62842..8c45d6f 100644
+--- a/Makefiles/Rules.inc
++++ b/Makefiles/Rules.inc
+@@ -119,6 +119,8 @@ SRC_FILES = \
+ 	Src/Model3/TileGen.cpp \
+ 	Src/Model3/Model3.cpp \
+ 	Src/CPU/PowerPC/ppc.cpp \
++	Src/CPU/PowerPC/PPCCoverage.cpp \
++	Src/OSD/SDL/InputScript.cpp \
+ 	Src/OSD/SDL/Main.cpp \
+ 	Src/OSD/SDL/Audio.cpp \
+ 	Src/OSD/SDL/Thread.cpp \
+diff --git a/Src/CPU/PowerPC/PPCCoverage.cpp b/Src/CPU/PowerPC/PPCCoverage.cpp
+new file mode 100644
+index 0000000..48e92c3
+--- /dev/null
++++ b/Src/CPU/PowerPC/PPCCoverage.cpp
+@@ -0,0 +1,594 @@
++// PPCCoverage: measurement hooks for the VF3 recomp study (not part of upstream Supermodel).
++// See PPCCoverage.h. Output goes to $SM_COV_DIR at exit: summary.txt plus raw files for merging.
++#include "PPCCoverage.h"
++#include "Supermodel.h"
++#include "PPCDisasm.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <map>
++#include <unordered_map>
++#include <algorithm>
++
++extern void ppc_cov_state(UINT32 *s);
++
++namespace PPCCov
++{
++  bool on = false;
++  uint64_t *ramCount = nullptr;
++  uint64_t *romCount = nullptr;
++  uint8_t  *ramDirty = nullptr;
++
++  static const uint32_t RAM_WORDS = 0x00800000 / 4;
++  static const uint32_t ROM_WORDS = 0x00800000 / 4;
++  static const uint32_t NO_WRITER = 0xFFFFFFFF;
++
++  static std::string s_dir;
++  static const uint8_t *s_ram = nullptr;
++  static const uint8_t *s_crom = nullptr;   // fixed 8 MB at 0xFF800000, banked CROM after it
++  static uint32_t s_cromBytes = 0;
++
++  static uint32_t *s_firstOp = nullptr;     // opcode seen the first time each RAM word ran
++  static uint32_t *s_lastWriter = nullptr;  // PC of the last store to each RAM word
++  static uint32_t *s_lastWriteFrame = nullptr;
++  static uint32_t *s_firstExecFrame = nullptr;
++  static uint8_t  *s_ramFlags = nullptr;    // 1 ran, 2 call target, 4 indirect target, 8 ran modified, 16 interrupt entry
++  static uint8_t  *s_romFlags = nullptr;
++  static uint64_t s_frame = 0;
++  static uint64_t s_uniqueRam = 0, s_uniqueOther = 0;
++  static uint64_t s_resets = 0;
++
++  struct Loader { uint64_t words = 0; uint32_t lo = 0xFFFFFFFF, hi = 0; uint32_t f0 = 0xFFFFFFFF, f1 = 0; };
++  static std::map<uint32_t, Loader> s_loaders;         // writer PC of code that later ran
++
++  struct SmcWriter { uint64_t writes = 0, changed = 0; uint32_t lo = 0xFFFFFFFF, hi = 0; uint64_t f0 = ~0ull, f1 = 0; };
++  static std::map<uint32_t, SmcWriter> s_smcWriters;   // stores that landed on code already run
++  struct SmcEvent { uint64_t frame; uint32_t addr, writer, oldw, neww; };
++  static std::vector<SmcEvent> s_smcEvents;            // first changed-value events, for local inspection
++
++  struct ModExec { uint64_t count = 0; uint64_t f0 = ~0ull, f1 = 0; std::vector<uint32_t> ops; };
++  static std::map<uint32_t, ModExec> s_modExec;        // code that ran with a different opcode than before
++  static uint64_t s_rewrittenSameExec = 0;
++
++  struct Edge { uint8_t kind; uint64_t count; };
++  enum { K_BCCTR, K_BCCTRL, K_BLR_JUMP, K_BLRL, K_RFI, K_EXC_OP, K_ASYNC, K_COUNT };
++  static const char *s_kindName[K_COUNT] = { "bcctr", "bcctrl", "blr-not-return", "bclrl", "rfi", "exception-in-op", "interrupt" };
++  static std::unordered_map<uint64_t, Edge> s_edges;
++  static std::unordered_map<uint32_t, uint64_t> s_calls;  // direct and indirect call targets
++  static uint64_t s_returns = 0;
++
++  // I/O: every access outside RAM and CROM, by address, size and direction
++  struct IoRec { uint64_t count = 0; uint64_t f0 = ~0ull, f1 = 0; uint64_t values[6]; int nvalues = 0; bool more = false; };
++  static std::unordered_map<uint64_t, IoRec> s_io;
++  static FILE *s_stateFile = nullptr;
++
++  void Io(uint32_t addr, int bits, bool write, uint64_t value)
++  {
++    IoRec &r = s_io[((uint64_t)addr << 8) | ((uint64_t)bits << 1) | (write ? 1 : 0)];
++    r.count++;
++    r.f0 = std::min(r.f0, s_frame);
++    r.f1 = std::max(r.f1, s_frame);
++    for (int i = 0; i < r.nvalues; i++)
++      if (r.values[i] == value)
++        return;
++    if (r.nvalues < 6)
++      r.values[r.nvalues++] = value;
++    else
++      r.more = true;
++  }
++
++  struct MarkRec { std::string name; uint64_t frame, ram, rom; };
++  static std::vector<MarkRec> s_marks;
++
++  static uint64_t RomUnique()
++  {
++    uint64_t n = 0;
++    for (uint32_t i = 0; i < ROM_WORDS; i++)
++      n += romCount[i] != 0;
++    return n;
++  }
++
++  uint64_t FrameNumber() { return s_frame; }
++
++  void Init(const uint8_t *ram, const uint8_t *crom, uint32_t cromBytes)
++  {
++    const char *dir = getenv("SM_COV_DIR");
++    if (!dir || !*dir)
++      return;
++    s_dir = dir;
++    s_ram = ram;
++    s_crom = crom;
++    s_cromBytes = cromBytes;
++    if (!ramCount)
++    {
++      ramCount = new uint64_t[RAM_WORDS]();
++      romCount = new uint64_t[ROM_WORDS]();
++      ramDirty = new uint8_t[RAM_WORDS]();
++      s_firstOp = new uint32_t[RAM_WORDS]();
++      s_lastWriter = new uint32_t[RAM_WORDS];
++      s_lastWriteFrame = new uint32_t[RAM_WORDS]();
++      s_firstExecFrame = new uint32_t[RAM_WORDS]();
++      s_ramFlags = new uint8_t[RAM_WORDS]();
++      s_romFlags = new uint8_t[ROM_WORDS]();
++      std::fill(s_lastWriter, s_lastWriter + RAM_WORDS, NO_WRITER);
++    }
++    on = true;
++    fprintf(stderr, "[cov] PowerPC coverage on, output to %s\n", s_dir.c_str());
++  }
++
++  void Reset()
++  {
++    if (!on)
++      return;
++    // RAM is cleared on reset: forget what was written, keep what ran
++    s_resets++;
++    std::fill(s_lastWriter, s_lastWriter + RAM_WORDS, NO_WRITER);
++  }
++
++  void FirstRam(uint32_t pc, uint32_t op)
++  {
++    uint32_t i = pc >> 2;
++    s_uniqueRam++;
++    s_firstOp[i] = op;
++    s_ramFlags[i] |= 1;
++    s_firstExecFrame[i] = (uint32_t)s_frame;
++    ramDirty[i] = 0;
++    Loader &l = s_loaders[s_lastWriter[i]];
++    l.words++;
++    l.lo = std::min(l.lo, pc);
++    l.hi = std::max(l.hi, pc);
++    l.f0 = std::min(l.f0, s_lastWriteFrame[i]);
++    l.f1 = std::max(l.f1, s_lastWriteFrame[i]);
++  }
++
++  void DirtyExec(uint32_t pc, uint32_t op)
++  {
++    uint32_t i = pc >> 2;
++    ramDirty[i] = 0;
++    if (op == s_firstOp[i])
++    {
++      s_rewrittenSameExec++;
++      return;
++    }
++    s_ramFlags[i] |= 8;
++    ModExec &m = s_modExec[pc];
++    m.count++;
++    m.f0 = std::min(m.f0, s_frame);
++    m.f1 = std::max(m.f1, s_frame);
++    if (m.ops.size() < 4 && std::find(m.ops.begin(), m.ops.end(), op) == m.ops.end())
++      m.ops.push_back(op);
++  }
++
++  void OtherExec(uint32_t pc, uint32_t op)
++  {
++    static uint32_t lastReported = 0;
++    s_uniqueOther++;
++    if (pc != lastReported)
++      fprintf(stderr, "[cov] code ran outside RAM and fixed CROM: %08X\n", pc);
++    lastReported = pc;
++  }
++
++  static void AddEdge(uint8_t kind, uint32_t src, uint32_t dst)
++  {
++    uint64_t key = ((uint64_t)src << 32) | dst;
++    auto it = s_edges.find(key);
++    if (it == s_edges.end())
++      s_edges.emplace(key, Edge{ kind, 1 });
++    else
++      it->second.count++;
++    uint8_t flag = kind == K_ASYNC ? 16 : 4;
++    if (dst < 0x00800000)
++      s_ramFlags[dst >> 2] |= flag;
++    else if (dst >= 0xFF800000)
++      s_romFlags[(dst - 0xFF800000) >> 2] |= flag;
++  }
++
++  static void AddCall(uint32_t dst)
++  {
++    s_calls[dst]++;
++    if (dst < 0x00800000)
++      s_ramFlags[dst >> 2] |= 2;
++    else if (dst >= 0xFF800000)
++      s_romFlags[(dst - 0xFF800000) >> 2] |= 2;
++  }
++
++  static uint32_t WordAt(uint32_t addr)
++  {
++    if (addr < 0x00800000)
++      return *(const uint32_t *)&s_ram[addr];
++    if (addr >= 0xFF800000)
++      return *(const uint32_t *)&s_crom[addr - 0xFF800000];
++    return 0;
++  }
++
++  static bool IsLinkBranch(uint32_t op)
++  {
++    uint32_t p = op >> 26;
++    if ((op & 1) == 0)
++      return false;
++    if (p == 18 || p == 16)
++      return true;
++    if (p == 19)
++    {
++      uint32_t x = (op >> 1) & 0x3FF;
++      return x == 16 || x == 528;
++    }
++    return false;
++  }
++
++  void Flow(uint32_t pc, uint32_t op, uint32_t npc)
++  {
++    uint32_t p = op >> 26;
++    bool lk = op & 1;
++    if (p == 18 || p == 16)
++    {
++      if (lk)
++        AddCall(npc);
++      return;
++    }
++    if (p == 19)
++    {
++      uint32_t x = (op >> 1) & 0x3FF;
++      if (x == 528)
++      {
++        AddEdge(lk ? K_BCCTRL : K_BCCTR, pc, npc);
++        if (lk)
++          AddCall(npc);
++        return;
++      }
++      if (x == 16)
++      {
++        if (lk)
++        {
++          AddEdge(K_BLRL, pc, npc);
++          AddCall(npc);
++          return;
++        }
++        // A return lands just after a branch-and-link; anything else is a jump through LR
++        if (IsLinkBranch(WordAt(npc - 4)))
++          s_returns++;
++        else
++          AddEdge(K_BLR_JUMP, pc, npc);
++        return;
++      }
++      if (x == 50)
++      {
++        AddEdge(K_RFI, pc, npc);
++        return;
++      }
++    }
++    AddEdge(K_EXC_OP, pc, npc);
++  }
++
++  void Async(uint32_t from, uint32_t to)
++  {
++    AddEdge(K_ASYNC, from, to);
++  }
++
++  void RamWrite(uint32_t addr, uint32_t oldWord, uint32_t newWord, uint32_t writerPC)
++  {
++    uint32_t i = addr >> 2;
++    s_lastWriter[i] = writerPC;
++    s_lastWriteFrame[i] = (uint32_t)s_frame;
++    if (ramCount[i] == 0)
++      return;
++    ramDirty[i] = 1;
++    SmcWriter &w = s_smcWriters[writerPC];
++    w.writes++;
++    w.lo = std::min(w.lo, addr);
++    w.hi = std::max(w.hi, addr);
++    w.f0 = std::min(w.f0, s_frame);
++    w.f1 = std::max(w.f1, s_frame);
++    if (oldWord != newWord)
++    {
++      w.changed++;
++      if (s_smcEvents.size() < 4096)
++        s_smcEvents.push_back(SmcEvent{ s_frame, addr, writerPC, oldWord, newWord });
++    }
++  }
++
++  // Per frame (SM_STATE=<file>): the CPU state and a hash of RAM, 128 words a frame, for lockstep checks
++  void Frame()
++  {
++    s_frame++;
++    if (!on)
++      return;
++    if (!s_stateFile)
++    {
++      const char *path = getenv("SM_STATE");
++      if (!path)
++        return;
++      s_stateFile = fopen(path, "wb");
++      if (!s_stateFile)
++        return;
++    }
++    UINT32 s[128] = {};
++    ppc_cov_state(s);
++    uint64_t h = 1469598103934665603ull;   // FNV-1a over the RAM words
++    const uint32_t *w = (const uint32_t *)s_ram;
++    for (uint32_t i = 0; i < RAM_WORDS; i++)
++      h = (h ^ w[i]) * 1099511628211ull;
++    s[114] = (uint32_t)(h >> 32);
++    s[115] = (uint32_t)h;
++    s[116] = (uint32_t)s_frame;
++    fwrite(s, 4, 128, s_stateFile);
++    // SM_RAM_AT=<frame>: RAM as it is after that frame, for finding what differs
++    static long ramAt = getenv("SM_RAM_AT") ? atol(getenv("SM_RAM_AT")) : -1;
++    if ((long)s_frame == ramAt)
++    {
++      std::string p = s_dir + "/ram_" + std::to_string(s_frame) + ".bin";
++      if (FILE *f = fopen(p.c_str(), "wb")) { fwrite(s_ram, 1, RAM_WORDS * 4, f); fclose(f); }
++    }
++  }
++
++  void Mark(const char *name)
++  {
++    if (!on)
++      return;
++    s_marks.push_back(MarkRec{ name, s_frame, s_uniqueRam, RomUnique() });
++    fprintf(stderr, "[cov] mark %s at frame %llu: %llu RAM instructions so far\n", name, (unsigned long long)s_frame,
++            (unsigned long long)s_uniqueRam);
++  }
++
++  // Coalesced runs of executed words
++  static void WriteRanges(FILE *f, const uint64_t *count, uint32_t words, uint32_t base, uint32_t *runs, uint32_t *lo, uint32_t *hi)
++  {
++    *runs = 0; *lo = 0xFFFFFFFF; *hi = 0;
++    uint32_t i = 0;
++    while (i < words)
++    {
++      if (!count[i]) { i++; continue; }
++      uint32_t s = i;
++      while (i < words && count[i]) i++;
++      if (f)
++        fprintf(f, "%08X %08X %u\n", base + s * 4, base + i * 4 - 4, i - s);
++      (*runs)++;
++      *lo = std::min(*lo, base + s * 4);
++      *hi = std::max(*hi, base + i * 4 - 4);
++    }
++  }
++
++  static FILE *Open(const char *name)
++  {
++    std::string p = s_dir + "/" + name;
++    FILE *f = fopen(p.c_str(), "w");
++    if (!f)
++      fprintf(stderr, "[cov] can't write %s\n", p.c_str());
++    return f;
++  }
++
++  // Where in CROM (fixed + banked) does the RAM code come from? Looks for the first run of 16 executed
++  // words, then compares every executed RAM word with the CROM image at that offset.
++  static void CompareWithRom(FILE *f)
++  {
++    uint32_t start = 0;
++    bool found = false;
++    for (uint32_t i = 0; i + 16 < RAM_WORDS && !found; i++)
++    {
++      uint32_t k = 0;
++      while (k < 16 && ramCount[i + k]) k++;
++      if (k == 16 && s_firstOp[i] != 0) { start = i; found = true; }
++    }
++    if (!found)
++    {
++      fprintf(f, "rom image: no run of 16 executed RAM words\n");
++      return;
++    }
++    uint32_t key[16];
++    for (int k = 0; k < 16; k++)
++      key[k] = s_firstOp[start + k];
++    std::vector<uint32_t> hits;
++    for (uint32_t off = 0; off + 64 <= s_cromBytes; off += 4)
++      if (memcmp(&s_crom[off], key, 64) == 0)
++        hits.push_back(off);
++    fprintf(f, "rom image: RAM %08X found at %zu CROM offset(s)", start * 4, hits.size());
++    for (size_t h = 0; h < hits.size() && h < 4; h++)
++      fprintf(f, " %s+%07X", hits[h] < 0x800000 ? "fixed" : "banked", hits[h] < 0x800000 ? hits[h] : hits[h] - 0x800000);
++    fprintf(f, "\n");
++    if (hits.empty())
++      return;
++    // RAM address A came from CROM byte offset base + A
++    int64_t base = (int64_t)hits[0] - (int64_t)start * 4;
++    fprintf(f, "rom image: RAM 0 corresponds to CROM offset %s0x%llX (fixed CROM starts at 0xFF800000)\n",
++            base < 0 ? "-" : "", (unsigned long long)(base < 0 ? -base : base));
++    uint64_t same = 0, differ = 0, outside = 0;
++    std::vector<uint32_t> diffs;
++    for (uint32_t i = 0; i < RAM_WORDS; i++)
++    {
++      if (!ramCount[i]) continue;
++      int64_t off = base + (int64_t)i * 4;
++      if (off < 0 || off + 4 > (int64_t)s_cromBytes) { outside++; continue; }
++      if (*(const uint32_t *)&s_crom[off] == s_firstOp[i]) same++;
++      else { differ++; if (diffs.size() < 64) diffs.push_back(i * 4); }
++    }
++    fprintf(f, "rom image: executed RAM words identical to the CROM image %llu, different %llu, beyond the image %llu\n",
++            (unsigned long long)same, (unsigned long long)differ, (unsigned long long)outside);
++    for (uint32_t a : diffs)
++      fprintf(f, "  differs at RAM %08X (first ran frame %u, written by %08X)\n", a, s_firstExecFrame[a >> 2], s_lastWriter[a >> 2]);
++  }
++
++  struct OpStat { uint64_t statics = 0, dynamic = 0; };
++
++  static void OpStats(FILE *f)
++  {
++    std::map<std::string, OpStat> stats;
++    char mnem[64], oprs[128];
++    auto add = [&](uint32_t op, uint32_t pc, uint64_t count)
++    {
++      std::string m;
++      if (DisassemblePowerPC(op, pc, mnem, oprs, sizeof(oprs), false) == Result::OKAY)
++        m = mnem;
++      else
++        m = "(invalid)";
++      OpStat &s = stats[m];
++      s.statics++;
++      s.dynamic += count;
++    };
++    for (uint32_t i = 0; i < RAM_WORDS; i++)
++      if (ramCount[i]) add(s_firstOp[i], i * 4, ramCount[i]);
++    for (uint32_t i = 0; i < ROM_WORDS; i++)
++      if (romCount[i]) add(*(const uint32_t *)&s_crom[i * 4], 0xFF800000 + i * 4, romCount[i]);
++    std::vector<std::pair<std::string, OpStat>> v(stats.begin(), stats.end());
++    std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second.dynamic > b.second.dynamic; });
++    fprintf(f, "# mnemonic static_count dynamic_count\n");
++    for (auto &e : v)
++      fprintf(f, "%-10s %8llu %14llu\n", e.first.c_str(), (unsigned long long)e.second.statics, (unsigned long long)e.second.dynamic);
++  }
++
++  void Dump()
++  {
++    if (!on)
++      return;
++    on = false;
++    uint64_t romUnique = RomUnique();
++
++    FILE *f = Open("cov_ram.txt");
++    uint32_t ramRuns, ramLo, ramHi, romRuns, romLo, romHi;
++    WriteRanges(f, ramCount, RAM_WORDS, 0, &ramRuns, &ramLo, &ramHi);
++    if (f) fclose(f);
++    f = Open("cov_rom.txt");
++    WriteRanges(f, romCount, ROM_WORDS, 0xFF800000, &romRuns, &romLo, &romHi);
++    if (f) fclose(f);
++
++    for (uint32_t i = 0; i < ROM_WORDS; i++)
++      if (romCount[i])
++        s_romFlags[i] |= 1;
++    if ((f = Open("flags_ram.bin"))) { fwrite(s_ramFlags, 1, RAM_WORDS, f); fclose(f); }
++    if ((f = Open("flags_rom.bin"))) { fwrite(s_romFlags, 1, ROM_WORDS, f); fclose(f); }
++
++    if ((f = Open("indirect.txt")))
++    {
++      fprintf(f, "# kind src dst count\n");
++      std::vector<std::pair<uint64_t, Edge>> v(s_edges.begin(), s_edges.end());
++      std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first < b.first; });
++      for (auto &e : v)
++        fprintf(f, "%s %08X %08X %llu\n", s_kindName[e.second.kind], (uint32_t)(e.first >> 32), (uint32_t)e.first, (unsigned long long)e.second.count);
++      fclose(f);
++    }
++    if ((f = Open("calls.txt")))
++    {
++      std::vector<std::pair<uint32_t, uint64_t>> v(s_calls.begin(), s_calls.end());
++      std::sort(v.begin(), v.end());
++      for (auto &e : v)
++        fprintf(f, "%08X %llu\n", e.first, (unsigned long long)e.second);
++      fclose(f);
++    }
++    if ((f = Open("smc_events.txt")))
++    {
++      fprintf(f, "# frame addr writer old new (first %zu changed-value stores onto code that had run)\n", s_smcEvents.size());
++      for (auto &e : s_smcEvents)
++        fprintf(f, "%llu %08X %08X %08X %08X\n", (unsigned long long)e.frame, e.addr, e.writer, e.oldw, e.neww);
++      fclose(f);
++    }
++    if ((f = Open("hot.txt")))
++    {
++      std::vector<std::pair<uint64_t, uint32_t>> v;
++      for (uint32_t i = 0; i < RAM_WORDS; i++) if (ramCount[i]) v.push_back({ ramCount[i], i * 4 });
++      for (uint32_t i = 0; i < ROM_WORDS; i++) if (romCount[i]) v.push_back({ romCount[i], 0xFF800000 + i * 4 });
++      std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
++      for (size_t k = 0; k < v.size() && k < 500; k++)
++        fprintf(f, "%08X %llu\n", v[k].second, (unsigned long long)v[k].first);
++      fclose(f);
++    }
++    if ((f = Open("opstats.txt"))) { OpStats(f); fclose(f); }
++    if ((f = Open("io.txt")))
++    {
++      fprintf(f, "# addr bits r/w count first_frame last_frame values\n");
++      std::vector<std::pair<uint64_t, IoRec>> v(s_io.begin(), s_io.end());
++      std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first < b.first; });
++      for (auto &e : v)
++      {
++        fprintf(f, "%08X %2u %c %10llu %7llu %7llu", (uint32_t)(e.first >> 8), (unsigned)((e.first >> 1) & 0x7F),
++                (e.first & 1) ? 'w' : 'r', (unsigned long long)e.second.count, (unsigned long long)e.second.f0,
++                (unsigned long long)e.second.f1);
++        for (int i = 0; i < e.second.nvalues; i++)
++          fprintf(f, " %llX", (unsigned long long)e.second.values[i]);
++        fprintf(f, "%s\n", e.second.more ? " ..." : "");
++      }
++      fclose(f);
++    }
++    if (s_stateFile)
++      fclose(s_stateFile);
++
++    f = Open("summary.txt");
++    if (!f)
++      return;
++    uint64_t dynRam = 0, dynRom = 0;
++    for (uint32_t i = 0; i < RAM_WORDS; i++) dynRam += ramCount[i];
++    for (uint32_t i = 0; i < ROM_WORDS; i++) dynRom += romCount[i];
++    fprintf(f, "frames %llu\nresets %llu\n", (unsigned long long)s_frame, (unsigned long long)s_resets);
++    fprintf(f, "instructions executed: RAM %llu, CROM %llu\n", (unsigned long long)dynRam, (unsigned long long)dynRom);
++    fprintf(f, "unique instructions: RAM %llu in %u runs (%08X-%08X), CROM %llu in %u runs (%08X-%08X), elsewhere %llu\n",
++            (unsigned long long)s_uniqueRam, ramRuns, ramLo, ramHi, (unsigned long long)romUnique, romRuns, romLo, romHi,
++            (unsigned long long)s_uniqueOther);
++    CompareWithRom(f);
++
++    fprintf(f, "\nwho wrote the RAM code that ran (writer PC, words, address range, frames written):\n");
++    for (auto &l : s_loaders)
++    {
++      char who[32];
++      if (l.first == NO_WRITER)
++        snprintf(who, sizeof(who), "never-written");
++      else
++        snprintf(who, sizeof(who), "pc %08X", l.first);
++      fprintf(f, "  %s %llu words %08X-%08X frames %u-%u\n", who, (unsigned long long)l.second.words, l.second.lo,
++              l.second.hi, l.second.f0, l.second.f1);
++    }
++
++    uint64_t smcWrites = 0, smcChanged = 0;
++    for (auto &w : s_smcWriters) { smcWrites += w.second.writes; smcChanged += w.second.changed; }
++    fprintf(f, "\nstores onto code that had already run: %llu (%llu changed the word) from %zu store PCs\n",
++            (unsigned long long)smcWrites, (unsigned long long)smcChanged, s_smcWriters.size());
++    for (auto &w : s_smcWriters)
++      fprintf(f, "  writer %08X: %llu stores, %llu changed, addresses %08X-%08X, frames %llu-%llu\n", w.first,
++              (unsigned long long)w.second.writes, (unsigned long long)w.second.changed, w.second.lo, w.second.hi,
++              (unsigned long long)w.second.f0, (unsigned long long)w.second.f1);
++    fprintf(f, "rewritten code that ran again with the same word: %llu times\n", (unsigned long long)s_rewrittenSameExec);
++    fprintf(f, "code that ran again with a different word: %zu addresses\n", s_modExec.size());
++    for (auto &m : s_modExec)
++      fprintf(f, "  %08X ran %llu times modified, frames %llu-%llu, %zu distinct new words\n", m.first,
++              (unsigned long long)m.second.count, (unsigned long long)m.second.f0, (unsigned long long)m.second.f1, m.second.ops.size());
++
++    uint64_t kindEdges[K_COUNT] = {}, kindCount[K_COUNT] = {};
++    std::map<uint32_t, uint64_t> kindTargets[K_COUNT];
++    for (auto &e : s_edges)
++    {
++      kindEdges[e.second.kind]++;
++      kindCount[e.second.kind] += e.second.count;
++      kindTargets[e.second.kind][(uint32_t)e.first]++;
++    }
++    fprintf(f, "\ncontrol flow:\n  call targets %zu\n  returns %llu\n", s_calls.size(), (unsigned long long)s_returns);
++    for (int k = 0; k < K_COUNT; k++)
++      fprintf(f, "  %-16s %6llu distinct edges, %6zu distinct targets, %llu times\n", s_kindName[k], (unsigned long long)kindEdges[k],
++              kindTargets[k].size(), (unsigned long long)kindCount[k]);
++    fprintf(f, "  interrupt entries:");
++    for (auto &t : kindTargets[K_ASYNC])
++      fprintf(f, " %08X", t.first);
++    fprintf(f, "\n");
++
++    // Cache and sync instructions say whether the program expects to change code
++    const char *watch[] = { "icbi", "isync", "sync", "dcbf", "dcbst", "dcbi", "dcbz", "eieio", "mtmsr", "rfi", "sc", "tw", "twi", "lwarx", "stwcx." };
++    std::map<std::string, std::pair<uint64_t, uint64_t>> seen;
++    char mnem[64], oprs[128];
++    for (uint32_t i = 0; i < RAM_WORDS; i++)
++      if (ramCount[i] && DisassemblePowerPC(s_firstOp[i], i * 4, mnem, oprs, sizeof(oprs), false) == Result::OKAY)
++        for (const char *w : watch)
++          if (!strcmp(mnem, w)) { seen[w].first++; seen[w].second += ramCount[i]; }
++    for (uint32_t i = 0; i < ROM_WORDS; i++)
++      if (romCount[i] && DisassemblePowerPC(*(const uint32_t *)&s_crom[i * 4], 0xFF800000 + i * 4, mnem, oprs, sizeof(oprs), false) == Result::OKAY)
++        for (const char *w : watch)
++          if (!strcmp(mnem, w)) { seen[w].first++; seen[w].second += romCount[i]; }
++    fprintf(f, "\ncache, sync and system instructions run (static, dynamic):\n");
++    for (const char *w : watch)
++      fprintf(f, "  %-7s %6llu %12llu\n", w, (unsigned long long)seen[w].first, (unsigned long long)seen[w].second);
++
++    fprintf(f, "\nmarks (frame, unique RAM instructions, unique CROM instructions):\n");
++    for (auto &m : s_marks)
++      fprintf(f, "  %-24s %8llu %8llu %8llu\n", m.name.c_str(), (unsigned long long)m.frame, (unsigned long long)m.ram, (unsigned long long)m.rom);
++    fprintf(f, "  %-24s %8llu %8llu %8llu\n", "(end)", (unsigned long long)s_frame, (unsigned long long)s_uniqueRam, (unsigned long long)romUnique);
++    fclose(f);
++    fprintf(stderr, "[cov] wrote %s/summary.txt\n", s_dir.c_str());
++  }
++}
+diff --git a/Src/CPU/PowerPC/PPCCoverage.h b/Src/CPU/PowerPC/PPCCoverage.h
+new file mode 100644
+index 0000000..7cbffca
+--- /dev/null
++++ b/Src/CPU/PowerPC/PPCCoverage.h
+@@ -0,0 +1,50 @@
++// PPCCoverage: measurement hooks for the VF3 recomp study (not part of upstream Supermodel).
++// Records which PowerPC instructions run, the indirect control flow, and every write to RAM
++// that lands on code already run (self-modifying code). Enabled by SM_COV_DIR=<folder>.
++#pragma once
++#include <cstdint>
++
++namespace PPCCov
++{
++  extern bool on;
++  extern uint64_t *ramCount;    // per RAM word (8 MB / 4)
++  extern uint64_t *romCount;    // per fixed CROM word (0xFF800000-0xFFFFFFFF)
++  extern uint8_t  *ramDirty;    // word written since it last ran
++
++  void Init(const uint8_t *ram, const uint8_t *crom, uint32_t cromBytes);
++  void FirstRam(uint32_t pc, uint32_t op);
++  void DirtyExec(uint32_t pc, uint32_t op);
++  void OtherExec(uint32_t pc, uint32_t op);
++  void Flow(uint32_t pc, uint32_t op, uint32_t npc);
++  void Async(uint32_t from, uint32_t to);
++  void RamWrite(uint32_t addr, uint32_t oldWord, uint32_t newWord, uint32_t writerPC);
++  void Reset();
++  void Io(uint32_t addr, int bits, bool write, uint64_t value);
++  void Frame();
++  void Mark(const char *name);
++  void Dump();
++  uint64_t FrameNumber();
++
++  inline void Exec(uint32_t pc, uint32_t op)
++  {
++    if (pc < 0x00800000)
++    {
++      uint32_t i = pc >> 2;
++      if (ramCount[i]++ == 0)
++        FirstRam(pc, op);
++      else if (ramDirty[i])
++        DirtyExec(pc, op);
++    }
++    else if (pc >= 0xFF800000)
++      romCount[(pc - 0xFF800000) >> 2]++;
++    else
++      OtherExec(pc, op);
++  }
++
++  // Called from the RAM write paths with the aligned word before and after the write
++  inline void RamWritten(uint32_t wordAddr, uint32_t oldWord, uint32_t newWord, uint32_t writerPC)
++  {
++    if (on)
++      RamWrite(wordAddr, oldWord, newWord, writerPC);
++  }
++}
+diff --git a/Src/CPU/PowerPC/ppc.cpp b/Src/CPU/PowerPC/ppc.cpp
+index 1343e69..4a4c4d1 100644
+--- a/Src/CPU/PowerPC/ppc.cpp
++++ b/Src/CPU/PowerPC/ppc.cpp
+@@ -33,6 +33,7 @@
+ #include <cstring>	// memset()
+ #include "Supermodel.h"
+ #include "CPU/Bus.h"
++#include "PPCCoverage.h"
+ 
+ // Typedefs that Supermodel no longer provides
+ typedef unsigned int	UINT;
+@@ -319,41 +320,61 @@ static void ppc_change_pc(UINT32 newpc)
+ 
+ static inline UINT8 READ8(UINT32 address)
+ {
+-	return Bus->Read8(address);
++	UINT8 v = Bus->Read8(address);
++	if (PPCCov::on && address >= 0x00800000 && address < 0xFF000000)
++		PPCCov::Io(address, 8, false, (uint64_t)v);
++	return v;
+ }
+ 
+ static inline UINT16 READ16(UINT32 address)
+ {
+-	return Bus->Read16(address);
++	UINT16 v = Bus->Read16(address);
++	if (PPCCov::on && address >= 0x00800000 && address < 0xFF000000)
++		PPCCov::Io(address, 16, false, (uint64_t)v);
++	return v;
+ }
+ 
+ static inline UINT32 READ32(UINT32 address)
+ {
+-	return Bus->Read32(address);
++	UINT32 v = Bus->Read32(address);
++	if (PPCCov::on && address >= 0x00800000 && address < 0xFF000000)
++		PPCCov::Io(address, 32, false, (uint64_t)v);
++	return v;
+ }
+ 
+ static inline UINT64 READ64(UINT32 address)
+ {
+-	return Bus->Read64(address);
++	UINT64 v = Bus->Read64(address);
++	if (PPCCov::on && address >= 0x00800000 && address < 0xFF000000)
++		PPCCov::Io(address, 64, false, (uint64_t)v);
++	return v;
+ }
+ 
+ static inline void WRITE8(UINT32 address, UINT8 data)
+ {
++	if (PPCCov::on && address >= 0x00800000)
++		PPCCov::Io(address, 8, true, (uint64_t)data);
+ 	Bus->Write8(address,data);
+ }
+ 
+ static inline void WRITE16(UINT32 address, UINT16 data)
+ {
++	if (PPCCov::on && address >= 0x00800000)
++		PPCCov::Io(address, 16, true, (uint64_t)data);
+ 	Bus->Write16(address,data);
+ }
+ 
+ static inline void WRITE32(UINT32 address, UINT32 data)
+ {
++	if (PPCCov::on && address >= 0x00800000)
++		PPCCov::Io(address, 32, true, (uint64_t)data);
+ 	Bus->Write32(address,data);
+ }
+ 
+ static inline void WRITE64(UINT32 address, UINT64 data)
+ {
++	if (PPCCov::on && address >= 0x00800000)
++		PPCCov::Io(address, 64, true, (uint64_t)data);
+ 	Bus->Write64(address,data);
+ }
+ 
+@@ -1161,3 +1182,16 @@ UINT32 ppc_read_msr()
+ {
+ 	return ppc_get_msr();
+ }
++
++// PPCCoverage: the CPU state at the end of each frame, for comparing other implementations against this one
++void ppc_cov_state(UINT32 *s)
++{
++	for (int i = 0; i < 32; i++) s[i] = ppc.r[i];
++	for (int i = 0; i < 32; i++) { s[32 + 2 * i] = (UINT32)(ppc.fpr[i].id >> 32); s[33 + 2 * i] = (UINT32)ppc.fpr[i].id; }
++	UINT32 cr = 0;
++	for (int i = 0; i < 8; i++) cr = (cr << 4) | (ppc.cr[i] & 0xF);
++	s[96] = cr; s[97] = ppc.xer; s[98] = ppc.lr; s[99] = ppc.ctr; s[100] = ppc.msr; s[101] = ppc.npc;
++	s[102] = ppc.srr0; s[103] = ppc.srr1; s[104] = ppc.dec; s[105] = (UINT32)ppc.tb; s[106] = (UINT32)(ppc.tb >> 32);
++	s[107] = ppc.fpscr; for (int i = 0; i < 4; i++) s[108 + i] = ppc.sprg[i];
++	s[112] = ppc.hid0; s[113] = ppc.hid1; s[117] = ppc.interrupt_pending; s[118] = ppc.timer_frac;
++}
+diff --git a/Src/CPU/PowerPC/ppc603.c b/Src/CPU/PowerPC/ppc603.c
+index 9cbc87e..4e06b5f 100644
+--- a/Src/CPU/PowerPC/ppc603.c
++++ b/Src/CPU/PowerPC/ppc603.c
+@@ -249,6 +249,8 @@ void ppc_reset(void)
+ 	ppc.icount = 0;
+ }
+ 
++static UINT32 s_covNext = 0xFFF00100;
++
+ int ppc_execute(int cycles)
+ {
+ 	UINT32 opcode;
+@@ -285,6 +287,8 @@ int ppc_execute(int cycles)
+ 	while( ppc.icount > 0 && !ppc.fatalError)
+ 	{
+ 		ppc.pc = ppc.npc;
++		if (PPCCov::on && ppc.pc != s_covNext)
++			PPCCov::Async(s_covNext, ppc.pc);
+ 		
+ 		// Debug breakpoints
+ 		/*
+@@ -297,6 +301,8 @@ int ppc_execute(int cycles)
+ 			
+ 		opcode = *ppc.op++;	// Supermodel byte reverses each aligned word (converting them to little endian) so they can be fetched directly
+ 		ppc.npc = ppc.pc + 4;
++		if (PPCCov::on)
++			PPCCov::Exec(ppc.pc, opcode);
+ 
+ #ifdef SUPERMODEL_DEBUGGER
+ 		if (PPCDebug != NULL)
+@@ -315,6 +321,10 @@ int ppc_execute(int cycles)
+ 			default:	optable[opcode >> 26](opcode); break;
+ 		}
+ 
++		if (PPCCov::on && ppc.npc != ppc.pc + 4)
++			PPCCov::Flow(ppc.pc, opcode, ppc.npc);
++		s_covNext = ppc.npc;
++
+ 		ppc.icount--;
+ 		
+ 		if (ppc.icount == ppc.dec_trigger_cycle)
+diff --git a/Src/Model3/Model3.cpp b/Src/Model3/Model3.cpp
+index af7bba2..2d8169b 100644
+--- a/Src/Model3/Model3.cpp
++++ b/Src/Model3/Model3.cpp
+@@ -235,6 +235,7 @@
+ #include <set>
+ #include <iostream>
+ #include <algorithm>
++#include "CPU/PowerPC/PPCCoverage.h"
+ 
+ /******************************************************************************
+  Model 3 Inputs
+@@ -1376,7 +1377,9 @@ void CModel3::Write8(UINT32 addr, UINT8 data)
+   // RAM (most frequently accessed)
+   if (addr < 0x00800000)
+   {
++    UINT32 covOld = *(UINT32 *) &ram[addr&~3];
+     ram[addr^3] = data;
++    PPCCov::RamWritten(addr&~3, covOld, *(UINT32 *) &ram[addr&~3], ppc_get_pc());
+     return;
+   }
+ 
+@@ -1517,7 +1520,9 @@ void CModel3::Write16(UINT32 addr, UINT16 data)
+   // RAM (most frequently accessed)
+   if (addr < 0x00800000)
+   {
++    UINT32 covOld = *(UINT32 *) &ram[addr&~3];
+     *(UINT16 *) &ram[addr^2] = data;
++    PPCCov::RamWritten(addr&~3, covOld, *(UINT32 *) &ram[addr&~3], ppc_get_pc());
+     return;
+   }
+ 
+@@ -1611,7 +1616,9 @@ void CModel3::Write32(UINT32 addr, UINT32 data)
+   // RAM (most frequently accessed)
+   if (addr<0x00800000)
+   {
++    UINT32 covOld = *(UINT32 *) &ram[addr];
+     *(UINT32 *) &ram[addr] = data;
++    PPCCov::RamWritten(addr, covOld, data, ppc_get_pc());
+     return;
+   }
+ 
+@@ -2800,6 +2807,7 @@ void CModel3::Reset(void)
+ {
+   // Clear memory (but do not modify backup RAM!)
+   memset(ram, 0, 0x800000);
++  PPCCov::Reset();
+ 
+   // Initial bank is bank 0
+   SetCROMBank(0xFF);
+@@ -2952,6 +2960,7 @@ Result CModel3::LoadGame(const Game &game, const ROMSet &rom_set)
+   PPCFetchRegions[2].end = 0;
+   PPCFetchRegions[2].ptr = NULL;
+   ppc_set_fetch(PPCFetchRegions);
++  PPCCov::Init(ram, crom, 0x800000 + 0x8000000);  // fixed CROM + banked CROM
+ 
+   // Initialize Real3D
+   m_stepping = ((game.stepping[0] - '0') << 4) | (game.stepping[2] - '0');
+diff --git a/Src/OSD/SDL/InputScript.cpp b/Src/OSD/SDL/InputScript.cpp
+new file mode 100644
+index 0000000..033ddbf
+--- /dev/null
++++ b/Src/OSD/SDL/InputScript.cpp
+@@ -0,0 +1,214 @@
++// InputScript: scripted inputs for headless measurement runs (not part of upstream Supermodel).
++//
++// One command per line, '#' starts a comment. The frame is absolute, or +N after the previous line's frame.
++//   <frame> press <input> [frames]   hold for a number of frames (default 6), then release
++//   <frame> hold <input>             hold until released
++//   <frame> release <input>
++//   <frame> random <p1|p2> <seed>    random play (sticks and buttons) for that player; "random p1 off" stops
++//   <frame> mark <name>              coverage phase marker
++//   <frame> shot <name>              save a screenshot
++//   <frame> quit
++// Inputs: p1.coin p1.start p1.up p1.down p1.left p1.right p1.punch p1.kick p1.guard p1.escape, the same for p2,
++// and test, service.
++#include "InputScript.h"
++#include "Inputs/Inputs.h"
++#include "Inputs/Input.h"
++#include "CPU/PowerPC/PPCCoverage.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cctype>
++#include <fstream>
++#include <sstream>
++#include <vector>
++#include <map>
++#include <memory>
++
++namespace InputScript
++{
++  struct Cmd
++  {
++    uint64_t frame;
++    std::string op, arg;
++    long n;
++  };
++
++  struct Random
++  {
++    bool on = false;
++    uint64_t state = 1;
++    uint64_t until = 0;
++    bool dir[4] = {}, btn[4] = {};
++  };
++
++  static std::vector<Cmd> s_cmds;
++  static size_t s_next = 0;
++  static bool s_active = false;
++  static std::map<std::string, uint64_t> s_held;   // input -> release frame (UINT64_MAX: until released)
++  static Random s_random[2];
++
++  static uint32_t Rand(Random &r)
++  {
++    r.state = r.state * 6364136223846793005ull + 1442695040888963407ull;
++    return (uint32_t)(r.state >> 33);
++  }
++
++  bool Load(const char *path)
++  {
++    std::ifstream in(path);
++    if (!in)
++    {
++      fprintf(stderr, "[script] can't read %s\n", path);
++      return false;
++    }
++    std::string line;
++    uint64_t prev = 0;
++    int lineNo = 0;
++    while (std::getline(in, line))
++    {
++      lineNo++;
++      size_t hash = line.find('#');
++      if (hash != std::string::npos)
++        line.resize(hash);
++      std::istringstream ss(line);
++      std::string when, op, arg, n;
++      if (!(ss >> when >> op))
++        continue;
++      ss >> arg >> n;
++      Cmd c;
++      c.frame = when[0] == '+' ? prev + strtoull(when.c_str() + 1, nullptr, 10) : strtoull(when.c_str(), nullptr, 10);
++      c.op = op;
++      c.arg = arg;
++      c.n = (n.empty() || !isdigit((unsigned char)n[0])) ? -1 : strtol(n.c_str(), nullptr, 0);
++      if (op != "press" && op != "hold" && op != "release" && op != "random" && op != "mark" && op != "shot" && op != "quit")
++      {
++        fprintf(stderr, "[script] %s:%d: unknown command '%s'\n", path, lineNo, op.c_str());
++        return false;
++      }
++      if (c.frame < prev)
++      {
++        fprintf(stderr, "[script] %s:%d: frame goes backwards\n", path, lineNo);
++        return false;
++      }
++      prev = c.frame;
++      s_cmds.push_back(c);
++    }
++    s_active = true;
++    fprintf(stderr, "[script] %zu commands from %s\n", s_cmds.size(), path);
++    return true;
++  }
++
++  bool Active()
++  {
++    return s_active;
++  }
++
++  static std::shared_ptr<CSwitchInput> Find(CInputs *in, const std::string &name)
++  {
++    if (name == "test") return in->test[0];
++    if (name == "service") return in->service[0];
++    if (name.size() < 4 || name[0] != 'p' || (name[1] != '1' && name[1] != '2') || name[2] != '.')
++      return nullptr;
++    int p = name[1] - '1';
++    std::string b = name.substr(3);
++    if (b == "coin") return in->coin[p];
++    if (b == "start") return in->start[p];
++    if (b == "up") return in->up[p];
++    if (b == "down") return in->down[p];
++    if (b == "left") return in->left[p];
++    if (b == "right") return in->right[p];
++    if (b == "punch") return in->punch[p];
++    if (b == "kick") return in->kick[p];
++    if (b == "guard") return in->guard[p];
++    if (b == "escape") return in->escape[p];
++    return nullptr;
++  }
++
++  static void Set(CInputs *in, const std::string &name, bool down)
++  {
++    auto s = Find(in, name);
++    if (!s)
++    {
++      fprintf(stderr, "[script] unknown input %s\n", name.c_str());
++      return;
++    }
++    s->prevValue = s->value;
++    s->value = down ? 1 : 0;
++  }
++
++  static void RandomStep(CInputs *in, int p, uint64_t frame)
++  {
++    Random &r = s_random[p];
++    if (frame >= r.until)
++    {
++      r.until = frame + 3 + Rand(r) % 18;
++      uint32_t d = Rand(r) % 12;          // 0-7 the eight directions, 8-11 neutral
++      static const int dx[8] = { 0, 1, 1, 1, 0, -1, -1, -1 }, dy[8] = { -1, -1, 0, 1, 1, 1, 0, -1 };
++      int x = d < 8 ? dx[d] : 0, y = d < 8 ? dy[d] : 0;
++      r.dir[0] = y < 0; r.dir[1] = y > 0; r.dir[2] = x < 0; r.dir[3] = x > 0;
++      r.btn[0] = Rand(r) % 100 < 35;      // punch
++      r.btn[1] = Rand(r) % 100 < 35;      // kick
++      r.btn[2] = Rand(r) % 100 < 25;      // guard
++      r.btn[3] = Rand(r) % 100 < 8;       // escape
++    }
++    std::string pre = p ? "p2." : "p1.";
++    static const char *dirs[4] = { "up", "down", "left", "right" }, *btns[4] = { "punch", "kick", "guard", "escape" };
++    for (int k = 0; k < 4; k++)
++    {
++      Set(in, pre + dirs[k], r.dir[k]);
++      Set(in, pre + btns[k], r.btn[k]);
++    }
++  }
++
++  Actions Step(CInputs *in, uint64_t frame)
++  {
++    Actions a;
++    if (!s_active)
++      return a;
++    for (auto it = s_held.begin(); it != s_held.end();)
++    {
++      if (frame >= it->second)
++      {
++        Set(in, it->first, false);
++        it = s_held.erase(it);
++      }
++      else
++        ++it;
++    }
++    for (int p = 0; p < 2; p++)
++      if (s_random[p].on)
++        RandomStep(in, p, frame);
++    while (s_next < s_cmds.size() && s_cmds[s_next].frame <= frame)
++    {
++      const Cmd &c = s_cmds[s_next++];
++      if (c.op == "press")
++        s_held[c.arg] = frame + (c.n > 0 ? c.n : 6);
++      else if (c.op == "hold")
++        s_held[c.arg] = UINT64_MAX;
++      else if (c.op == "release")
++      {
++        s_held.erase(c.arg);
++        Set(in, c.arg, false);
++      }
++      else if (c.op == "random")
++      {
++        int p = c.arg == "p2" ? 1 : 0;
++        s_random[p].on = c.n >= 0;   // "off" parses as no number
++        s_random[p].state = (uint64_t)c.n * 2654435761ull + 1;
++        s_random[p].until = 0;
++        if (!s_random[p].on)
++          for (const char *b : { "up", "down", "left", "right", "punch", "kick", "guard", "escape" })
++            Set(in, std::string(p ? "p2." : "p1.") + b, false);
++      }
++      else if (c.op == "mark")
++        PPCCov::Mark(c.arg.c_str());
++      else if (c.op == "shot")
++        a.shot = c.arg.empty() ? "shot" : c.arg;
++      else if (c.op == "quit")
++        a.quit = true;
++    }
++    for (auto &h : s_held)
++      Set(in, h.first, true);
++    return a;
++  }
++}
+diff --git a/Src/OSD/SDL/InputScript.h b/Src/OSD/SDL/InputScript.h
+new file mode 100644
+index 0000000..5479d40
+--- /dev/null
++++ b/Src/OSD/SDL/InputScript.h
+@@ -0,0 +1,21 @@
++// InputScript: scripted inputs for headless measurement runs (not part of upstream Supermodel).
++// Enabled by SM_SCRIPT=<file>. See InputScript.cpp for the format.
++#pragma once
++#include <string>
++#include <cstdint>
++
++class CInputs;
++
++namespace InputScript
++{
++  struct Actions
++  {
++    bool quit = false;
++    std::string shot;   // save a screenshot with this name
++  };
++
++  bool Load(const char *path);
++  bool Active();
++  // Called once per frame after the inputs are polled, before the frame runs
++  Actions Step(CInputs *inputs, uint64_t frame);
++}
+diff --git a/Src/OSD/SDL/Main.cpp b/Src/OSD/SDL/Main.cpp
+index 08810fa..40c497a 100644
+--- a/Src/OSD/SDL/Main.cpp
++++ b/Src/OSD/SDL/Main.cpp
+@@ -72,6 +72,8 @@
+ #include <memory>
+ #include <vector>
+ #include <algorithm>
++#include "OSD/SDL/InputScript.h"
++#include "CPU/PowerPC/PPCCoverage.h"
+ #include <GL/glew.h>
+ 
+ #ifdef SUPERMODEL_WIN32
+@@ -304,7 +306,7 @@ static Result CreateGLScreen(bool coreContext, const std::string &caption, bool
+   }
+ 
+   // Set video mode
+-  s_window = SDL_CreateWindow(caption.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, *xResPtr, *yResPtr, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | (fullScreen ? SDL_WINDOW_FULLSCREEN : 0));
++  s_window = SDL_CreateWindow(caption.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, *xResPtr, *yResPtr, SDL_WINDOW_OPENGL | (getenv("SM_HIDDEN") ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) | (fullScreen ? SDL_WINDOW_FULLSCREEN : 0));
+   if (nullptr == s_window)
+   {
+     ErrorLog("Unable to create an OpenGL display: %s\n", SDL_GetError());
+@@ -928,6 +930,9 @@ int Supermodel(const Game &game, ROMSet *rom_set, IEmulator *Model3, CInputs *In
+   // Initialize and load ROMs
+   if (Result::OKAY != Model3->Init())
+     return 1;
++  if (const char *script = getenv("SM_SCRIPT"))
++    if (!InputScript::Load(script))
++      return 1;
+   if (Model3->LoadGame(game, *rom_set) != Result::OKAY)
+     return 1;
+   *rom_set = ROMSet();  // free up this memory we won't need anymore
+@@ -1048,12 +1053,23 @@ int Supermodel(const Game &game, ROMSet *rom_set, IEmulator *Model3, CInputs *In
+     // Poll the inputs
+     if (!Inputs->Poll(&game, xOffset, yOffset, xRes, yRes))
+       quit = true;
++    InputScript::Actions scriptActions = InputScript::Step(Inputs, PPCCov::FrameNumber());
+ 
+     // Render if paused, otherwise run a frame
+     if (paused)
+       Model3->RenderFrame();
+     else
++    {
+       Model3->RunFrame();
++      PPCCov::Frame();
++    }
++    if (!scriptActions.shot.empty())
++    {
++      const char *dir = getenv("SM_COV_DIR");
++      SaveFrameBuffer(Util::Format() << (dir ? dir : ".") << "/shot_" << std::setfill('0') << std::setw(6) << PPCCov::FrameNumber() << "_" << scriptActions.shot << ".bmp");
++    }
++    if (scriptActions.quit)
++      quit = true;
+ 
+ #ifdef SUPERMODEL_DEBUGGER
+     bool processUI = true;
+@@ -1354,6 +1370,8 @@ int Supermodel(const Game &game, ROMSet *rom_set, IEmulator *Model3, CInputs *In
+   }
+ #endif // SUPERMODEL_DEBUGGER
+ 
++  PPCCov::Dump();
++
+   // Save NVRAM
+   SaveNVRAM(Model3);
+ 
+@@ -2356,6 +2374,10 @@ int main(int argc, char **argv)
+   }
+   LogConfig(s_runtime_config);
+ 
++  // Hidden measurement runs: no Dock icon on a Mac (the window itself is created hidden)
++  if (getenv("SM_HIDDEN"))
++    SDL_SetHint("SDL_MAC_BACKGROUND_APP", "1");
++
+   // Initialize SDL (individual subsystems get initialized later)
+   if (SDL_Init(0) != 0)
+   {

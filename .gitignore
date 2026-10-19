@@ -1,0 +1,14 @@
+roms/
+*.zip
+*.7z
+*.bin
+*.nv
+NVRAM/
+build/
+.DS_Store
+# the site's Pages Function and the referrer collector's address (tools/site/build.py)
+/functions/
+.refhit-url
+/tools/site/strip/node_modules/
+/tools/site/strip/package-lock.json
+__pycache__/
