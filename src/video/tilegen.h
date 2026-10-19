@@ -96,6 +96,10 @@ private:
 	struct Backdrop { bool ok = false; uint32_t desc = 0; int w = 0, h = 0, x0 = 0, y0 = 0; int16_t bank[128] = {}; int seen[128] = {}; bool known = false; int game_x = 0, game_y = 0, prev_x = 0, prev_y = 0; uint64_t game_frame = ~0ull; std::vector<uint16_t> map; };   // (map: the stage's entries, read from the ROM once a stage)   // (game_*: the game's place this frame, prev_*: the frame before's, in tiles)   // (known: the stage's map read this frame, its place found or not)
 	Backdrop backdrop;
 	uint64_t refind_frame = ~0ull;
+	// (this frame: a palette's see-through colours, by its first colour's place / 16: 4-bit, a bit each; 8-bit, 256 bits)
+	std::vector<uint64_t> clear_cols = std::vector<uint64_t>(4096 * 4);
+	std::vector<uint8_t> clear_known = std::vector<uint8_t>(4096);   // (8-bit's from 2048)
+	std::vector<uint8_t> solid_memo = std::vector<uint8_t>(1 << 17);   // (this frame: a pattern's entry and depth: 0 not looked at, 1 solid, 2 see-through)
 	uint64_t full_failed_sum = 0, full_failed_frame = 0;   // (the backdrop looked for in the whole map in vain: the screen's rows then, and when)
 	std::unordered_map<uint64_t, uint64_t> row_failed;   // (a row's tiles and the map: the frame it was last looked for in vain)
 	struct RowFound { uint64_t frame = ~0ull; int row = -1; uint64_t sum = 0; bool found = false; int x = 0, y = 0; std::vector<std::pair<int, int>> moved; } row_found;   // (a row looked for alone in the map: the other side's the same)

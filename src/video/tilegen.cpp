@@ -613,6 +613,8 @@ void TileGen::line(const m3::Model3 &board, unsigned y)
 		}
 		learn(board);
 		ext_rows.clear(); ext_how.clear(); ext_edge.clear(); wrap_votes.clear(); mem_mirror.clear();
+		std::fill(clear_known.begin(), clear_known.end(), 0);
+		std::fill(solid_memo.begin(), solid_memo.end(), 0);
 	}
 	const uint32_t *vram = reinterpret_cast<const uint32_t *>(board.tile_ram.data());
 	const uint32_t *pal = vram + 0x40000;
@@ -831,6 +833,52 @@ void TileGen::line(const m3::Model3 &board, unsigned y)
 			// (its last good tiles, flipped), as is a run into tiles with nothing (or only black) in them.
 			const uint64_t key = uint64_t(prim + k) << 40 | uint64_t(row) << 32 | uint64_t(side) << 31 | uint64_t(uint32_t(l.sx) & 0x7FFFFFFF);
 			auto found = ext_rows.find(key);
+			// The stage's backdrop is solid picture, but the patterns the game has let go of hold other pictures (the
+			// HUD's digits, a round's letters), and the map points at them past what the game keeps loaded: at 21:9
+			// the sides reach about 26 tiles out, where 16:9's reach 12. A tile with a see-through texel isn't the
+			// backdrop's: the good one before it, mirrored, in its place (the seam stays whole).
+			auto solid_only = [&](std::vector<std::pair<uint32_t, bool>> &row_tiles) {
+				if (prim + k != 3) return;
+				auto solid = [&](uint32_t e) {
+					// the palette's see-through colours (bit 15), looked up once a frame; then the pattern's texels
+					// tested against them, its words read as they are
+					const uint32_t block = l.four ? (e & 0x7FF0) : (e & 0x7F00), colours = l.four ? 16 : 256;
+					const size_t slot = size_t(block >> 4) + (l.four ? 0 : 2048);   // (a 4-bit and an 8-bit palette may start at one place)
+					uint64_t *cc = &clear_cols[slot * 4];
+					if (!clear_known[slot]) {
+						clear_known[slot] = 1;
+						cc[0] = cc[1] = cc[2] = cc[3] = 0;
+						for (uint32_t i = 0; i < colours; i++)
+							if (pal[(block | i) & 0x7FFF] & 0x8000) cc[i >> 6] |= 1ull << (i & 63);
+					}
+					if (!(cc[0] | cc[1] | cc[2] | cc[3])) return true;
+					uint8_t &m = solid_memo[size_t(e & 0xFFFF) << 1 | size_t(l.four)];   // (and the pattern's answer: rows share them)
+					if (m) return m == 1;
+					m = 1;
+					if (l.four) {
+						const uint32_t pat = (((e & 0x3FFF) << 1) | (e >> 15)) * 8;
+						const bool zero_only = cc[0] == 1;   // (the usual: colour 0 alone see-through: a word's nibbles tested at once)
+						for (int fy = 0; fy < 8 && m == 1; fy++) {
+							const uint32_t w = vram[(pat + fy) & 0x3FFFF];
+							if (zero_only) { if ((w - 0x11111111u) & ~w & 0x88888888u) m = 2; }
+							else for (int sh = 0; sh < 32; sh += 4) if (cc[0] >> ((w >> sh) & 15) & 1) { m = 2; break; }
+						}
+					} else {
+						const uint32_t pat = (e & 0x3FFF) * 16;
+						for (int i = 0; i < 16 && m == 1; i++) {
+							const uint32_t w = vram[(pat + i) & 0x3FFFF];
+							for (int sh = 0; sh < 32; sh += 8) { const uint32_t t = (w >> sh) & 0xFF; if (cc[t >> 6] >> (t & 63) & 1) { m = 2; break; } }
+						}
+					}
+					return m == 1;
+				};
+				if (!solid(edge_e)) return;
+				std::pair<uint32_t, bool> good_one = { edge_e, false };
+				for (auto &t : row_tiles) {
+					if (solid(t.first)) good_one = t;
+					else t = good_one = { good_one.first, !good_one.second };
+				}
+			};
 			// (the backdrop: as the game's own map has it)
 			static const bool no_backdrop = getenv("VF3_NO_BACKDROP") != nullptr;   // (tests: the sides without the game's map)
 			// (with the map's place not found for the frame, each row still looked for in it)
@@ -956,6 +1004,7 @@ void TileGen::line(const m3::Model3 &board, unsigned y)
 					out.push_back({ backdrop_entry(board, row_x0 + s + edge + d * (j + 1), row_y), false });
 				ext_how[key] = std::vector<uint8_t>(out.size(), 1);
 				ext_edge[key] = backdrop_entry(board, row_x0 + s + edge, row_y);
+				solid_only(out);
 				found = ext_rows.emplace(key, std::move(out)).first;
 			}
 			if (found == ext_rows.end()) {
@@ -1103,6 +1152,7 @@ void TileGen::line(const m3::Model3 &board, unsigned y)
 					}
 				}
 				ext_how[key] = std::move(how);
+				solid_only(out);
 				found = ext_rows.emplace(key, std::move(out)).first;
 			}
 			// The edge tile's part past the screen from the map too: the game rewrites the column at the screen's edge
