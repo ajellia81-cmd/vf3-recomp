@@ -1,4 +1,4 @@
-# Personal iOS build 1: interpreter-only Model 3; no external video-recording process.
+# Personal iOS build 1 with synthetic geometry comparison: interpreter-only Model 3; no external video-recording process.
 name: Personal unsigned iOS IPA (Model 3)
 on:
   push:
