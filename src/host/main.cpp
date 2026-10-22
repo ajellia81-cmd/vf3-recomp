@@ -96,12 +96,18 @@
 #include "png.h"
 #include "input_script.h"
 #include "menu.h"
+#include "bg_saver.h"
+#if defined(VF3_IOS)
+#include "ios_platform.h"
+#include "ios_input.h"
+#endif
+#include "display_color.h"
 #include "controls.h"
 #include "sysinfo.h"
 #include "d3d11_map.h"
 #include "../gpu/r3d_gpu.h"
 #include <SDL3/SDL.h>
-#ifdef _WIN32
+#if defined(_WIN32) || defined(VF3_IOS)
 #include <SDL3/SDL_main.h>   // WinMain, and argv as UTF-8
 #endif
 #include <algorithm>
@@ -243,6 +249,9 @@ const sys_key SYS_KEYS[] = {
 hotkey read_inputs(m3::Controls &c, SDL_Gamepad *pads[2], pad_state ps[2], const player_controls ctl[2])
 {
 	c = m3::Controls();
+#if defined(VF3_IOS)
+	const auto ios=ios_input_read();
+#endif
 	const bool *ks = SDL_GetKeyboardState(nullptr);
 	for (const auto &k : SYS_KEYS)
 		if (ks[k.key]) {
@@ -279,11 +288,23 @@ hotkey read_inputs(m3::Controls &c, SDL_Gamepad *pads[2], pad_state ps[2], const
 		};
 		for (int a = 0; a < C_START; a++)
 			if (key(ctl[p].key[a])) act(a);
-		const bool kstart = key(ctl[p].key[C_START]);
+#if defined(VF3_IOS)
+		for(int a=0;a<C_START;++a) if(ios.down[p][a]) act(a);
+		if(ios.menu_pressed) hk=hotkey::menu;
+#endif
+		const bool kstart = key(ctl[p].key[C_START])
+#if defined(VF3_IOS)
+			|| ios.down[p][C_START]
+#endif
+			;
 		bool start_held = kstart;   // (held, as the cabinet's: a character chosen with Start held is in the 2P outfit)
 		if (kstart && !key_start_was[p]) press_start();
 		key_start_was[p] = kstart;
-		const bool kcoin = key(ctl[p].key[C_COIN]);
+		const bool kcoin = key(ctl[p].key[C_COIN])
+#if defined(VF3_IOS)
+			|| ios.down[p][C_COIN]
+#endif
+			;
 		if (kcoin && !key_coin_was[p] && !g_pc_mode) st.coin_frames = 6;
 		key_coin_was[p] = kcoin;
 		// a key set as Menu opens it too (Esc always does)
@@ -401,49 +422,6 @@ bool save_blob(const std::string &path, const void *src, size_t n)
 // hard disk, a hitch every few seconds while the arcade's bookkeeping kept changing the backup RAM in play. put copies
 // the bytes and returns; the writer thread writes the newest copy of each file; finish writes what's left and stops
 // (a put after it is dropped: the caller writes the final copies itself).
-struct bg_saver
-{
-	std::mutex m;
-	std::condition_variable cv;
-	std::map<std::string, std::vector<uint8_t>> pending;
-	bool stop = false;
-	std::thread writer{ [this] { run(); } };   // (last: started once the rest is made)
-
-	void put(const std::string &path, const void *src, size_t n)
-	{
-		std::vector<uint8_t> bytes(static_cast<const uint8_t *>(src), static_cast<const uint8_t *>(src) + n);
-		{
-			std::lock_guard<std::mutex> lk(m);
-			if (stop) return;
-			pending[path] = std::move(bytes);
-		}
-		cv.notify_one();
-	}
-	void run()
-	{
-		for (;;) {
-			std::map<std::string, std::vector<uint8_t>> now;
-			{
-				std::unique_lock<std::mutex> lk(m);
-				cv.wait(lk, [&] { return stop || !pending.empty(); });
-				if (pending.empty() && stop) return;
-				now.swap(pending);
-			}
-			for (auto &[path, bytes] : now)
-				if (!save_blob(path, bytes.data(), bytes.size())) fprintf(stderr, "couldn't save %s\n", path.c_str());
-		}
-	}
-	void finish()
-	{
-		{
-			std::lock_guard<std::mutex> lk(m);
-			stop = true;
-		}
-		cv.notify_one();
-		if (writer.joinable()) writer.join();
-	}
-	~bg_saver() { finish(); }
-};
 
 uint64_t fnv(const void *p, size_t n, uint64_t h = 1469598103934665603ull)
 {
@@ -458,6 +436,7 @@ struct settings
 	static constexpr int VERSION = 3;
 	int version = VERSION;
 	bool upgraded = false;   // (an upgrade made as it was read: saved at once)
+	int ios_resolution=0, brightness=100;
 	int scale = 0, aspect = 0, volume = 100, renderer3d = 2;   // renderer3d: 0 the CPU, 1 the GPU, 2 Auto
 	int music = 100, effects = 100;   // within the volume
 	int arcade_coin = -2;   // the arcade way's coin setting, while the PC way's FREE PLAY replaces it (-1 none to give back, -2 none kept yet)
@@ -505,6 +484,7 @@ struct settings
 		flag("background_filter", smooth_bg);   // (VF1's and VF2's name)
 		flag("sharp_textures", sharp_textures);
 		num("screen_filter", filter, 0, 2);
+		num("ios_resolution",ios_resolution,0,6); num("brightness",brightness,50,200);
 		num("crt_colours", crt_colours, 0, 5);
 		num("graphics", graphics, 0, 1);
 		num("antialiasing", aa, 0, 3);
@@ -556,6 +536,7 @@ struct settings
 		if (!gpu3d_failed.empty()) fprintf(f, "gpu_3d_failed = %s\n", gpu3d_failed.c_str());
 		fprintf(f, "crt_colours = %d\nsharp_textures = %d\n", crt_colours, int(sharp_textures));
 		if (graphics) fprintf(f, "graphics = %d\n", graphics);
+		fprintf(f,"ios_resolution = %d\nbrightness = %d\n",ios_resolution,brightness);
 		fprintf(f, "screen_filter = %d\nantialiasing = %d\nmusic_volume = %d\neffects_volume = %d\narcade_coins = %d\nframe_timings = %d\n", filter, aa, music, effects, arcade_coin, int(timings));
 		for (int p = 0; p < 2; p++) ctl[p].save(f, p);
 		const bool flushed = flush_to_disk(f);
@@ -597,6 +578,12 @@ bool copy_whole(const std::filesystem::path &from, const std::filesystem::path &
 // The zip's path in `out`; false if they cancel.
 bool first_launch(const std::string &data, const std::string &keep, const std::string &folder, std::string &out)
 {
+#if defined(VF3_IOS)
+	const std::string saved=data+"/roms/vf3.zip";
+	if (std::filesystem::is_regular_file(saved)) { out=saved; return true; }
+	out=ios_import_rom(); return !out.empty();
+#endif
+
 	namespace fs = std::filesystem;
 	const fs::path own = fs::path(data) / "roms";
 	const fs::path roms = folder.empty() ? own : fs::path(folder), zip = roms / "vf3.zip";
@@ -942,7 +929,7 @@ struct Game
 
 } // namespace
 
-int main(int argc, char **argv)
+static int run_game(int argc, char **argv, bool &quit_application)
 {
 	if (getenv("VF3_HIDDEN")) SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
 	const bool pace_log = getenv("VF3_PACE_LOG") != nullptr;
@@ -995,6 +982,9 @@ int main(int argc, char **argv)
 	// The game and the data folder (see the top)
 	std::error_code ec;
 	std::string data = getenv("VF3_DATA") ? getenv("VF3_DATA") : "";
+#if defined(VF3_IOS)
+	data=ios_data_directory(); arg_interp=true;
+#endif
 	bool players = false;
 	std::string keep_data;   // (the Steam Deck package's: where its zip is kept across updates)
 	const std::string home = program_folder();
@@ -1055,6 +1045,9 @@ int main(int argc, char **argv)
 	if (arg_volume >= 0) cfg.volume = arg_volume;
 	if (arg_music >= 0) cfg.music = arg_music;
 	if (arg_effects >= 0) cfg.effects = arg_effects;
+#if defined(VF3_IOS)
+	cfg.fullscreen=true; cfg.scale=cfg.ios_resolution ? cfg.ios_resolution : 4;
+#endif
 	g_pc_mode = !cfg.arcade;
 	int aspect_i = cfg.aspect;
 
@@ -1078,7 +1071,7 @@ int main(int argc, char **argv)
 	load_blob(eeprom_path, board.eeprom.regs, sizeof(board.eeprom.regs));
 	auto nvram_hash = [&] { return fnv(board.eeprom.regs, sizeof(board.eeprom.regs), fnv(board.backup.data(), board.backup.size())); };
 	uint64_t saved_hash = nvram_hash();
-	bg_saver saver;
+	bg_saver saver([](const std::string &p,const uint8_t *b,size_t n){return save_blob(p,b,n);});
 	// (in play: copied for the writer thread, bg_saver; at the quit: written here, the writer finished first)
 	auto save_nvram = [&](bool now = false) {
 		if (game.emu_thread.joinable()) game.job_wait();   // (not while a frame runs alongside)
@@ -1133,6 +1126,9 @@ int main(int argc, char **argv)
 		const auto t0 = std::chrono::steady_clock::now();
 		game.tiles_on = false;
 		while (game_frame < BOOT_FRAMES) {
+#if defined(VF3_IOS)
+			ios_service_events();
+#endif
 			game.run_frame(false, false);
 			game.audio.clear();
 			game_frame++;
@@ -1141,7 +1137,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "boot: %llu frames in %.2f s, unseen\n", (unsigned long long)game_frame,
 				std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 	};
+#ifndef VF3_IOS
 	boot();
+#endif
 
 #ifdef _WIN32
 	SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "1");
@@ -1161,6 +1159,10 @@ int main(int argc, char **argv)
 	SDL_Window *win = SDL_CreateWindow("Virtua Fighter 3", win_w, win_h,
 		SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (cfg.fullscreen ? SDL_WINDOW_FULLSCREEN : 0) | SDL_WINDOW_HIDDEN);
 	if (!win) return fail(std::string("Couldn't open the window: ") + SDL_GetError());
+#if defined(VF3_IOS)
+	SDL_ShowWindow(win); SDL_SyncWindow(win); ios_input_install(win);
+	boot();
+#endif
 	SDL_HideCursor();
 	// the window's icon (the Mac app and the Windows exe carry their own)
 	if (SDL_Surface *icon = SDL_LoadPNG((find_assets() + "/icon/icon.png").c_str())) {
@@ -1630,7 +1632,7 @@ int main(int argc, char **argv)
 	// Where the picture goes in the window: as large as fits, its shape kept
 	auto picture_rect = [&](SDL_FRect &all, SDL_FRect &mid) {
 		int pw = 0, ph = 0;
-		SDL_GetRenderOutputSize(ren, &pw, &ph);
+		SDL_GetCurrentRenderOutputSize(ren, &pw, &ph);
 		const float a = picture_aspect();
 		float w = float(pw), h = float(ph);
 		if (w / h > a) w = h * a; else h = w / a;
@@ -1712,7 +1714,7 @@ int main(int argc, char **argv)
 			if (doubled) {
 				double sum = 0;
 				int n = 0;
-				for (int y = 0; y < h; y += 3)
+				for (int y = 0; y < h; y++)
 					for (int x = 0; x < w; x += 7) { float v[3]; glass_at(x, y, v); sum += v[0] + v[1] + v[2]; n += 3; }
 				gain = std::min(1.4f, float(n / sum));
 			}
@@ -1755,20 +1757,26 @@ int main(int argc, char **argv)
 	bool crt_failed = false;
 	// the texture to put the picture together in, the CRT colours on (null: straight into the window)
 	auto crt_target = [&]() -> SDL_Texture * {
-		if (!cfg.crt_colours || crt_failed) return nullptr;
-		if (!crt_state) {
+		#if defined(VF3_IOS)
+		const bool want_crt=cfg.crt_colours && !crt_failed;
+		if (!want_crt && cfg.ios_resolution && cfg.brightness==100) return nullptr;
+#else
+		const bool want_crt=cfg.crt_colours && !crt_failed;
+		if(!want_crt) return nullptr;
+#endif
+		if (want_crt && !crt_state) {
 			SDL_GPUDevice *gd = SDL_GetGPURendererDevice(ren);
 			if (gd) crt_shader = colour_shader(gd);
 			SDL_GPURenderStateCreateInfo ci = {};
 			ci.fragment_shader = crt_shader;
 			if (crt_shader) crt_state = SDL_CreateGPURenderState(ren, &ci);
-			if (!crt_state) {
+			if (want_crt && !crt_state) {
 				fprintf(stderr, "CRT colours: not on this renderer (%s)\n", gd ? SDL_GetError() : "SDL's GPU renderer only");
 				crt_failed = true;
 				return nullptr;
 			}
 		}
-		if (crt_set != cfg.crt_colours) {
+		if (want_crt && crt_set != cfg.crt_colours) {
 			const crt_colours &c = CRT_COLOURS[cfg.crt_colours];
 			const float u[12] = { c.m[0], c.m[1], c.m[2], c.gamma, c.m[3], c.m[4], c.m[5], 0, c.m[6], c.m[7], c.m[8], 0 };
 			SDL_SetGPURenderStateFragmentUniforms(crt_state, 0, u, sizeof u);
@@ -1776,6 +1784,9 @@ int main(int argc, char **argv)
 		}
 		int pw = 0, ph = 0;
 		SDL_GetRenderOutputSize(ren, &pw, &ph);
+		#if defined(VF3_IOS)
+		if(!cfg.ios_resolution){pw=2868;ph=1320;}
+#endif
 		if (pw < 1 || ph < 1) return nullptr;
 		if (!crt_tex || pw != crt_tex_w || ph != crt_tex_h) {
 			if (crt_tex) SDL_DestroyTexture(crt_tex);
@@ -1788,6 +1799,7 @@ int main(int argc, char **argv)
 		return crt_tex;
 	};
 	auto compose = [&](bool filter = true) {
+		prepare_overlay_view(ren);
 		SDL_Texture *crt = crt_target();
 		if (crt) SDL_SetRenderTarget(ren, crt);
 		SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
@@ -1814,11 +1826,15 @@ int main(int argc, char **argv)
 		SDL_RenderTexture(ren, tex_above, nullptr, &mid);
 		if (crt) {
 			SDL_SetRenderTarget(ren, nullptr);
-			SDL_SetGPURenderState(ren, crt_state);
-			SDL_RenderTexture(ren, crt, nullptr, nullptr);
+			SDL_SetGPURenderState(ren, cfg.crt_colours && !crt_failed ? crt_state : nullptr);
+			#if defined(VF3_IOS)
+			if(!cfg.ios_resolution) prepare_game_view(ren,2868,1320);
+#endif
+			draw_game_picture(ren,crt,cfg.brightness);
 			SDL_SetGPURenderState(ren, nullptr);
 		}
-		if (filter) draw_filter(all);
+		prepare_overlay_view(ren);
+		if (filter) { picture_rect(all,mid); draw_filter(all); }
 	};
 	auto read_window = [&](const std::string &path, const SDL_Rect *area = nullptr) {
 		SDL_Surface *s = SDL_RenderReadPixels(ren, area);
@@ -1991,10 +2007,17 @@ int main(int argc, char **argv)
 	auto back_item = [&] { return menu_item{ "Back", "Back to the previous page.", {}, {}, [&] { menu.pop(); } }; };
 	auto display_page = [&] {
 		menu_page p{ "Display", "", {} };
+		#if defined(VF3_IOS)
+		p.items.push_back({ "Resolution", "Original 1x-6x raster scales, then 2868 x 1320 output resolved from 4x. All choices honor Picture shape.",
+			[&]{return cfg.ios_resolution?std::to_string(cfg.ios_resolution)+"x":std::string("2868 x 1320 (iPhone)");},
+			[&](int d){int i=std::clamp((cfg.ios_resolution?cfg.ios_resolution-1:6)+d,0,6);cfg.ios_resolution=i==6?0:i+1;set_scale(cfg.ios_resolution?cfg.ios_resolution:4);} });
+#else
 		p.items.push_back({ "Render scale",
 			"How sharp the 3D is. 1x is the original arcade resolution; higher is sharper but needs a faster computer. If yours can't keep up, the game lowers it for you. (F5)",
 			[&] { return std::to_string(chosen_scale()) + "x" + (gov.scale_cut ? " (lowered to " + std::to_string(scale) + "x)" : ""); },
 			[&](int d) { set_scale(chosen_scale() + d); } });
+#endif
+		p.items.push_back({ "Brightness", "100% preserves the original picture; higher values brighten it before clipping.", [&]{return std::to_string(cfg.brightness)+"%";}, [&](int d){cfg.brightness=std::clamp(cfg.brightness+5*d,50,200);cfg_dirty=true;} });
 		p.items.push_back({ "Antialiasing",
 			"Smooths jagged edges on the 3D: 2x and 3x draw it twice or three times as large each way and average it down. Cleaner, but four or nine times the work.",
 			[&] {
@@ -2276,9 +2299,11 @@ int main(int argc, char **argv)
 		p.items.push_back({ "Arcade settings", "Difficulty, rounds, energy, demo sound, country and the service menu. Changing them restarts the game.", {}, {},
 							[&] { if (arcade_before.empty()) arcade_before = arcade_bytes(); menu.push(arcade_page()); } });
 		p.items.push_back({ "Controls", "Each player's controller, keys and buttons.", {}, {}, [&] { menu.push(controls_page()); } });
-		p.items.push_back({ "Quit", "Saves and closes the game.", {}, {}, [&] { running = false; } });
+		p.items.push_back({ "Quit", "Saves and closes the game.", {}, {}, [&] { quit_application=true; running = false; } });
 		return p;
 	};
+
+
 	bool sound_paused = false;
 	auto sync_menu_sound = [&] {
 		if (!audio || menu.is_open() == sound_paused) return;
@@ -2286,6 +2311,25 @@ int main(int argc, char **argv)
 		if (sound_paused) SDL_PauseAudioStreamDevice(audio); else SDL_ResumeAudioStreamDevice(audio);
 	};
 	auto open_menu = [&] { if (game.emu_thread.joinable()) game.job_wait(); if (menu.ready() && !menu.is_open()) menu.open(main_page()); sync_menu_sound(); };
+#if defined(VF3_IOS)
+	struct background_save {
+		std::function<void()> fn;
+		bool installed=true;
+		static bool SDLCALL watch(void *ctx,SDL_Event *event){
+			if(SDL_IsMainThread() && event->type==SDL_EVENT_WILL_ENTER_BACKGROUND) static_cast<background_save*>(ctx)->fn();
+			return true;
+		}
+		void stop(){if(installed){SDL_RemoveEventWatch(watch,this);installed=false;}}
+		~background_save(){stop();}
+	} lifecycle{[&]{
+		if(game.emu_thread.joinable())game.job_wait();
+		ios_input_reset();saver.flush();
+		save_blob(backup_path,board.backup.data(),board.backup.size());
+		save_blob(eeprom_path,board.eeprom.regs,sizeof(board.eeprom.regs));
+		cfg.save(settings_path);open_menu();
+	}};
+	SDL_AddEventWatch(background_save::watch,&lifecycle);
+#endif
 
 	// ---- test hooks ----
 	std::vector<std::pair<SDL_Scancode, uint64_t>> test_keys;   // VF3_KEYS
@@ -2400,6 +2444,9 @@ int main(int argc, char **argv)
 	t9.t0 = SDL_GetTicksNS();
 	uint64_t save_t = SDL_GetTicksNS();   // the settings saved every 3 s when changed (the NVRAM once a minute: nvram_t)
 	while (running) {
+#if defined(VF3_IOS)
+		ios_input_set_menu(menu.is_open());
+#endif
 		pass++;
 		const uint64_t pass_t0 = SDL_GetTicksNS();
 		int pass_kind = 0;   // (the pace line's: 0 a picture only, 1 a frame's first half, 2 its second, 3 a whole frame)
@@ -2916,7 +2963,20 @@ int main(int argc, char **argv)
 	SDL_DestroyTexture(tex_above);
 	SDL_DestroyRenderer(ren);
 	SDL_DestroyWindow(win);
+
+#if defined(VF3_IOS)
+	lifecycle.stop(); ios_input_uninstall();
+#endif
 	SDL_Quit();
 	fprintf(stderr, "quit after %llu frames\n", (unsigned long long)game_frame);
 	return 0;
+}
+
+int main(int argc,char **argv){
+ bool quit_application=false;
+ const int result=run_game(argc,argv,quit_application);
+#if defined(VF3_IOS)
+ if(quit_application) std::exit(result);
+#endif
+ return result;
 }

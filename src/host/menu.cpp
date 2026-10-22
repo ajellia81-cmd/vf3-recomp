@@ -1,4 +1,8 @@
 #include "menu.h"
+#include "display_color.h"
+#if defined(VF3_IOS)
+#include "ios_platform.h"
+#endif
 #include <RmlUi/Core.h>
 #include "RmlUi_Platform_SDL.h"
 #include "RmlUi_Renderer_SDL.h"
@@ -387,14 +391,26 @@ void game_menu::render(bool fps)
 	int lw = 0, lh = 0;
 	SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
 	SDL_GetRenderLogicalPresentation(m->ren, &lw, &lh, &mode);
-	SDL_SetRenderLogicalPresentation(m->ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+	float sx=1,sy=1;SDL_GetRenderScale(m->ren,&sx,&sy);
+	SDL_Rect viewport{},clip{};
+	bool vp=SDL_RenderViewportSet(m->ren),cp=SDL_RenderClipEnabled(m->ren);
+	SDL_GetRenderViewport(m->ren,&viewport);SDL_GetRenderClipRect(m->ren,&clip);
+	prepare_overlay_view(m->ren);
 	int w = 0, h = 0;
 	SDL_GetCurrentRenderOutputSize(m->ren, &w, &h);
 	m->ctx->SetDimensions(Rml::Vector2i(w, h));
 	m->ctx->SetDensityIndependentPixelRatio(float(h) / 720.0f);
+#if defined(VF3_IOS)
+	float left=0,top=0,right=0,bottom=0;ios_safe_area(m->win,left,top,right,bottom);
+	if(m->overlay)if(auto *f=m->overlay->GetElementById("fps")){
+	 f->SetProperty("left",std::to_string(int(left+18.0f*h/720))+"px");
+	 f->SetProperty("right","auto");f->SetProperty("top",std::to_string(int(top+12.0f*h/720))+"px");
+	}
+#endif
 	m->ctx->Update();
 	m->gfx->BeginOverlay();
 	m->ctx->Render();
 	m->gfx->EndFrame();
 	SDL_SetRenderLogicalPresentation(m->ren, lw, lh, mode);
+	SDL_SetRenderScale(m->ren,sx,sy);SDL_SetRenderViewport(m->ren,vp?&viewport:nullptr);SDL_SetRenderClipRect(m->ren,cp?&clip:nullptr);
 }
