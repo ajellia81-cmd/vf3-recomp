@@ -51,6 +51,7 @@ for name in ('SDL.txt', 'FreeType.txt', 'FTL.TXT'):
 include('FreeType attribution', 'Portions of this software are copyright (c) The FreeType Project (www.freetype.org). All rights reserved.')
 sdk = Path(subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip())
 zlib_header = (sdk / 'usr/include/zlib.h').read_text()
+include('Original assets/icon artwork', 'Mr Finster, CC BY 4.0. https://creativecommons.org/licenses/by/4.0/ . The supplied personal app icon is separate.')
 include('System zlib', zlib_header.split('/*', 1)[1].split('*/', 1)[0])
 (staged / 'LICENSES.txt').write_text('Third-party notices for the personal iOS build.\n' + ''.join(notices))
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()

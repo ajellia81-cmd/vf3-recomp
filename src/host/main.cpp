@@ -147,6 +147,9 @@ static bool message_box(SDL_MessageBoxFlags flags, const char *title, const std:
 }
 
 namespace {
+#if defined(VF3_IOS)
+ios_input_snapshot ios_frame;
+#endif
 
 constexpr double FRAME_HZ = 57.524160;       // the Model 3's frame rate (the reference's timing)
 constexpr int SOUND_RATE = 44100;
@@ -250,7 +253,7 @@ hotkey read_inputs(m3::Controls &c, SDL_Gamepad *pads[2], pad_state ps[2], const
 {
 	c = m3::Controls();
 #if defined(VF3_IOS)
-	const auto ios=ios_input_read();
+	const auto &ios=ios_frame;
 #endif
 	const bool *ks = SDL_GetKeyboardState(nullptr);
 	for (const auto &k : SYS_KEYS)
@@ -2462,6 +2465,8 @@ static int run_game(int argc, char **argv, bool &quit_application)
 	uint64_t save_t = SDL_GetTicksNS();   // the settings saved every 3 s when changed (the NVRAM once a minute: nvram_t)
 	while (running) {
 #if defined(VF3_IOS)
+		ios_frame=ios_input_read();
+		if(ios_frame.menu_pressed){if(menu.is_open())menu.close();else open_menu();ios_frame.menu_pressed=false;}
 		ios_input_set_menu(menu.is_open());
 #endif
 		pass++;
