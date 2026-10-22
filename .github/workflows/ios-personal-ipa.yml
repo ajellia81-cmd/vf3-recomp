@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: personal-ipa-${{ github.ref }}
+  group: vf3-personal-build-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   ios:
