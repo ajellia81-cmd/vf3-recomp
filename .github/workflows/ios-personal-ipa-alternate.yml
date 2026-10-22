@@ -52,7 +52,7 @@ jobs:
           ios/build/controls-config
           xcrun clang++ -std=c++20 -O2 tools/checks/autosave.cpp -o ios/build/autosave-check
           ios/build/autosave-check
-          xcrun clang++ -std=c++20 -O2 -I"$(brew --prefix sdl3)/include" tools/checks/display_gpu.cpp src/gpu/r3d_gpu.cpp src/video/r3d_raster.cpp -L"$(brew --prefix sdl3)/lib" -lSDL3 -o ios/build/display-gpu
+          xcrun clang++ -std=c++20 -O2 -I"$(brew --prefix sdl3)/include" tools/checks/display_gpu.cpp src/gpu/r3d_gpu.cpp src/video/r3d_raster.cpp src/video/r3d_scene.cpp -L"$(brew --prefix sdl3)/lib" -lSDL3 -o ios/build/display-gpu
           ios/build/display-gpu
       - name: Generate and verify interpreter-only project
         run: |
