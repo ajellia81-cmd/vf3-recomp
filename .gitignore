@@ -16,3 +16,8 @@ __pycache__/
 functions/
 .refhit-url
 /*-recomp/
+
+/ios/Dependencies/*.xcframework/
+/ios/Generated/
+/ios/build/
+/ios/*.xcodeproj/

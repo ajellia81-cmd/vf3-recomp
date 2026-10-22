@@ -1,0 +1,97 @@
+name: VF3Recomp
+options:
+  minimumXcodeGenVersion: 2.38.0
+  createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+targets:
+  VF3Recomp:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources
+      - path: ../src
+        excludes:
+          - rec/ppc_rec.cpp
+          - rec/vf3_map.cpp
+          - "gpu/*.hlsl"
+      - path: ../third_party/mame/m68000
+      - path: ../third_party/rmlui/Source/Core
+        excludes:
+          - CMakeLists.txt
+          - "**/CMakeLists.txt"
+      - path: ../third_party/rmlui/Backends
+      - path: Generated/Assets.xcassets
+        buildPhase: resources
+      - path: ../assets
+        type: folder
+        buildPhase: resources
+    configFiles:
+      Debug: Config/Debug.xcconfig
+      Release: Config/Release.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ajellia81.vf3recomp
+        PRODUCT_NAME: Virtua Fighter 3 Recomp
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_FILE: Info.plist
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.games
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        SUPPORTS_MACCATALYST: NO
+    dependencies:
+      # Place locally built/downloaded XCFrameworks in ios/Dependencies/. They are deliberately
+      # not vendored or fetched by project generation.
+      - framework: Dependencies/SDL3.xcframework
+        embed: false
+      - framework: Dependencies/FreeType.xcframework
+        embed: false
+      - sdk: UIKit.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreAudio.framework
+      - sdk: CoreMotion.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: Foundation.framework
+      - sdk: Metal.framework
+      - sdk: GameController.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: QuartzCore.framework
+    scheme:
+      gatherCoverageData: false
+      buildImplicitDependencies: true
+  ROMImportChecks:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests
+      - path: Sources/VF3ROMImport.mm
+      - path: ../src/machine/romset.cpp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ajellia81.vf3recomp.importchecks
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../third_party/glm"
+        GENERATE_INFOPLIST_FILE: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        OTHER_LDFLAGS: "$(inherited) -lz"
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: UniformTypeIdentifiers.framework
+schemes:
+  ROMImportChecks:
+    build:
+      targets:
+        ROMImportChecks: all
+    test:
+      targets: [ROMImportChecks]
