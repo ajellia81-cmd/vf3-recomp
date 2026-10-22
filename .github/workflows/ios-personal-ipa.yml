@@ -1,4 +1,4 @@
-# Build 2: all resolutions, including iPhone, honor Picture shape.
+# Personal iOS build 1: interpreter-only Model 3; no external video-recording process.
 name: Personal unsigned iOS IPA (Model 3)
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 concurrency:
   group: personal-ipa-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   ios:
     if: github.repository == 'ajellia81-cmd/vf3-recomp'

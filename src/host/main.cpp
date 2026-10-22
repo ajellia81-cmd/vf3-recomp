@@ -436,6 +436,7 @@ struct settings
 	static constexpr int VERSION = 3;
 	int version = VERSION;
 	bool upgraded = false;   // (an upgrade made as it was read: saved at once)
+	bool pads_swapped=false;
 	int ios_resolution=0, brightness=100;
 	int scale = 0, aspect = 0, volume = 100, renderer3d = 2;   // renderer3d: 0 the CPU, 1 the GPU, 2 Auto
 	int music = 100, effects = 100;   // within the volume
@@ -475,6 +476,7 @@ struct settings
 		num("renderer_3d", renderer3d, 0, 2);
 		if (auto it = kv.find("roms_folder"); it != kv.end()) roms_folder = it->second;
 		if (auto it = kv.find("gpu_3d_failed"); it != kv.end()) gpu3d_failed = it->second;
+		flag("pads_swapped",pads_swapped);
 		flag("fullscreen", fullscreen);
 		flag("arcade_mode", arcade);
 		flag("frame_timings", timings);
@@ -529,6 +531,7 @@ struct settings
 		}
 		fprintf(f, "# Virtua Fighter 3 settings (the in-game menu writes these)\n");
 		fprintf(f, "settings_version = %d\n", VERSION);
+		fprintf(f,"pads_swapped = %d\n",int(pads_swapped));
 		fprintf(f, "scale = %d\npicture_shape = %d\nfullscreen = %d\nvolume = %d\narcade_mode = %d\nshow_fps = %d\n"
 				"smooth_motion = %d\nrenderer_3d = %d\nbackground_filter = %d\n", scale, aspect, int(fullscreen), volume, int(arcade), int(show_fps),
 				int(smooth), renderer3d, int(smooth_bg));
@@ -1878,7 +1881,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 
 	// ---- pads ----
 	SDL_Gamepad *pads[2] = { nullptr, nullptr };
-	bool pads_swapped = false;
+	bool &pads_swapped = cfg.pads_swapped;
 	auto guid_of = [](SDL_JoystickID id) {
 		char buf[64];
 		SDL_GUIDToString(SDL_GetGamepadGUIDForID(id), buf, sizeof buf);
@@ -1971,8 +1974,18 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		gov_fresh();
 		fprintf(stderr, "render scale %dx\n", scale);
 	};
+	auto player_scale_to = [&](int s){
+#if defined(VF3_IOS)
+		cfg.ios_resolution=std::clamp(s,1,MAX_SCALE);
+#endif
+		set_scale(s);
+	};
 	auto set_shape = [&](int a) { aspect_i = cfg.aspect = a; cfg_dirty = true; gov_fresh(); };
-	auto set_fullscreen = [&](bool on) { SDL_SetWindowFullscreen(win, on); SDL_SyncWindow(win); cfg.fullscreen = on; cfg_dirty = true; gov_fresh(); };
+	auto set_fullscreen = [&](bool on) {
+#if defined(VF3_IOS)
+		on=true;
+#endif
+		SDL_SetWindowFullscreen(win, on); SDL_SyncWindow(win); cfg.fullscreen = on; cfg_dirty = true; gov_fresh(); };
 	int test_frames = 0;        // the test button held for these frames (the menu's Service menu; Start in the test menu)
 	int service_frames = 0, test_mode_frames = 0;   // (Down in the test menu: the service button)
 	bool test_pending = false, in_test = false, test_down_was = false, test_start_was = false;
@@ -2072,12 +2085,14 @@ static int run_game(int argc, char **argv, bool &quit_application)
 			[&] { return std::string(cfg.graphics ? "Direct3D 12" : "Auto (Vulkan first)"); },
 			[&](int) { cfg.graphics = !cfg.graphics; cfg_dirty = true; } });
 #endif
-		p.items.push_back({ "Show FPS", "Shows the frame rate in the top right corner.",
+		p.items.push_back({ "Show FPS", "Shows the frame rate (inside the safe area on iOS).",
 			[&] { return on_off(cfg.show_fps); },
 			[&](int) { cfg.show_fps = !cfg.show_fps; cfg_dirty = true; if (!cfg.show_fps) menu.set_fps(""); } });
+		#if !defined(VF3_IOS)
 		p.items.push_back({ "Fullscreen", "Play fullscreen or in a window. (F11, F or Alt+Enter)",
 			[&] { return on_off(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN); },
 			[&](int) { set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)); } });
+#endif
 		p.items.push_back(back_item());
 		return p;
 	};
@@ -2281,7 +2296,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 							 [&] {
 								 auto choice = [&](int p) { return pads[p] ? guid_of(SDL_GetGamepadID(pads[p])) : std::string("none"); };
 								 std::string a = choice(0), b = choice(1);
-								 if (a == b) { pads_swapped = !pads_swapped; std::swap(pads[0], pads[1]); return; }
+								 if (a == b) { pads_swapped = !pads_swapped; cfg_dirty=true; std::swap(pads[0], pads[1]); return; }
 								 cfg.ctl[0].pad_choice = b;
 								 cfg.ctl[1].pad_choice = a;
 								 cfg_dirty = true;
@@ -2387,7 +2402,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		fseek(rec.wav, 0, SEEK_END);
 	};
 	auto rec_stop = [&] {
+		#if !defined(VF3_IOS)
 		if (rec.video) pclose(rec.video);
+#endif
 		if (rec.wav) { wav_header(); fclose(rec.wav); }
 		if (rec.on) fprintf(stderr, "record: %llu pictures, %.1f s, to %s\n", (unsigned long long)rec.n, rec.n / 60.0, rec.dir.c_str());
 		rec.video = rec.wav = nullptr;
@@ -2491,7 +2508,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 					cfg.timings = !cfg.timings; cfg_dirty = true; title_now.clear();
 					t9 = {}; t9.t0 = SDL_GetTicksNS();
 					break;
-				case SDL_SCANCODE_F5: set_scale(scale % MAX_SCALE + 1); break;
+				case SDL_SCANCODE_F5: player_scale_to(scale % MAX_SCALE + 1); break;
 				case SDL_SCANCODE_F6: set_shape((aspect_i + 1) % N_ASPECTS); break;
 				case SDL_SCANCODE_F11: set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)); break;
 				case SDL_SCANCODE_F12: {
@@ -2549,7 +2566,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 				rec.w = ww & ~1; rec.h = wh & ~1;
 				const std::string cmd = "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgba -s " + std::to_string(rec.w) + "x" + std::to_string(rec.h) +
 				                        " -r 60 -i - -c:v libx264 -preset slow -crf 12 -pix_fmt yuv420p '" + rec.dir + "/video.mp4'";
+				#if !defined(VF3_IOS)
 				rec.video = popen(cmd.c_str(), "w");
+#endif
 				rec.wav = fopen((rec.dir + "/sound.wav").c_str(), "wb");
 				if (rec.wav) wav_header();
 				fprintf(stderr, "record: from frame %llu, %dx%d\n", (unsigned long long)rec.from, rec.w, rec.h);
@@ -2687,7 +2706,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 			if (quit_after >= 0 && int64_t(game_frame) >= quit_after) running = false;
 			switch (hk) {
 			case hotkey::menu: open_menu(); break;
-			case hotkey::scale: set_scale(scale % MAX_SCALE + 1); break;
+			case hotkey::scale: player_scale_to(scale % MAX_SCALE + 1); break;
 			case hotkey::aspect: set_shape((aspect_i + 1) % N_ASPECTS); break;
 			case hotkey::none: break;
 			}
