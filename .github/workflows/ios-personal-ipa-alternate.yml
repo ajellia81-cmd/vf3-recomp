@@ -60,6 +60,10 @@ jobs:
           python3 ios/Scripts/prepare-app-icon.py
           xcodegen generate --spec ios/project.yml
           python3 ios/Scripts/verify-project.py
+      - name: Verify touch Menu transitions without game data
+        run: |
+          xcrun clang++ -std=c++20 -O2 -I"$(brew --prefix sdl3)/include" tools/checks/touch_menu.cpp -o ios/build/touch-menu
+          ios/build/touch-menu
       - name: Compile unsigned iPhone app
         run: |
           xcodebuild -project ios/VF3Recomp.xcodeproj -scheme VF3Recomp \
