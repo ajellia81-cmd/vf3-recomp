@@ -59,9 +59,9 @@ sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True)
 (staged / 'BUILD-INFO.json').write_text(json.dumps({
     'source_commit': sha, 'execution': 'interpreter-only', 'presentation_target': [2868,1320], 'output_source_raster_scale': 4, 'selectable_integer_scales': [1, 2, 3, 4, 5, 6], 'brightness_range_percent': [50, 200],
     'signed': False, 'roms_included': False, 'purpose': 'personal use; re-sign before installation',
-    'gameplay_device_tested': False,
+    'gameplay_device_tested': False, 'automatic_combat_haptics': False, 'combat_diagnostics_schema': 1,
 }, indent=2) + '\n')
-ipa = out / 'VirtuaFighter3-build2-unsigned.ipa'
+ipa = out / 'VirtuaFighter3-build3-unsigned.ipa'
 subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', 'Payload', ipa.name], cwd=out, check=True)
 with zipfile.ZipFile(ipa) as z:
     assert z.testzip() is None

@@ -9,7 +9,7 @@ for phase in app['buildPhases']:
  if p['isa']=='PBXSourcesBuildPhase':
   for f in p['files']:
    ref=objects[objects[f]['fileRef']];sources.append(pathlib.PurePosixPath(ref.get('path',ref.get('name',''))).name)
-for required in ['main.cpp','ppc.cpp','ppc_rec_stub.cpp','r3d_gpu.cpp','VF3Platform.mm','VF3ROMImport.mm','VF3InputBridge.mm']:
+for required in ['main.cpp','ppc.cpp','ppc_rec_stub.cpp','r3d_gpu.cpp','VF3Platform.mm','VF3ROMImport.mm','VF3InputBridge.mm','VFFightHaptics.mm']:
  assert sources.count(required)==1,(required,sources.count(required))
 for forbidden in ['ppc_rec.cpp','vf3_map.cpp','sljitLir.c']:
  assert forbidden not in sources,forbidden
