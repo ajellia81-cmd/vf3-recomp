@@ -74,7 +74,7 @@ To identify current-health fields without copying Revision C offsets:
    Virtua Fighter 3 Recomp inside the app's data container. In LiveContainer use
    that installed app's data folder. Export the CSV only, not game files/dumps.
 
-Searches inspect aligned 16-bit guest values from 1 to 1000. A larger integer
+Searches inspect aligned 16-bit guest values from 1 to 1000 in RAM above the\nimmutable 0xA0000-byte program image documented by Model3::program_image. The\nprogram image is excluded even from in-memory candidate discovery. A larger integer
 field whose upper half is zero can also leave a low-half candidate. Floating-point,
 negative, larger or indirectly encoded health is outside this initial search.
 A search keeps at most 262144 candidates and fails visibly on overflow; it never

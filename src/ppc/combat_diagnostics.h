@@ -19,7 +19,8 @@ public:
  bool started=false, overflow=false;
  bool start(const std::vector<uint8_t> &ram) {
   candidates.clear(); started=false; overflow=false;
-  for(uint32_t a=0;a+1<ram.size() && a<0x800000;a+=2) {
+  // Exclude the immutable 0..0x9FFFF program image documented by Model3::program_image.
+  for(uint32_t a=0xa0000;a+1<ram.size() && a<0x800000;a+=2) {
    unsigned v=health_word(ram.data(),a);
    if(v && v<=1000) {
     if(candidates.size()==limit) { candidates.clear(); overflow=true; return false; }

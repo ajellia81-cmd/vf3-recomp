@@ -1,4 +1,4 @@
-# Personal iOS build 3: warmed haptic test and opt-in Revision D combat diagnostics.
+# Personal iOS build 3: warmed haptic test and scalar data discovery excluding the program image.
 name: Personal unsigned iOS IPA (Model 3)
 on:
   push:
