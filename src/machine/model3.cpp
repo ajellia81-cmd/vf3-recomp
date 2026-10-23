@@ -381,6 +381,9 @@ bool Model3::load(const std::string &zip, std::string &error)
 	tex_fifo.reserve(0x100000 / 4);
 	tex_ram.assign(2048 * 2048, 0);
 	cpu.attach(this, ram.data(), crom.data());
+#if defined(VF3_IOS)
+	cpu.combat_probe=&combat_probe;
+#endif
 	// Step 1.0: a 66 MHz 603e on a 66 MHz bus (multiplier 1.0); the reference's PVR and HID1 for it
 	cpu.configure(0x00071202, 2, 66000000, 0xF0000000);
 	irq.cpu = &cpu;
@@ -391,6 +394,9 @@ bool Model3::load(const std::string &zip, std::string &error)
 
 void Model3::reset()
 {
+#if defined(VF3_IOS)
+	combat_probe.clear();
+#endif
 	std::fill(ram.begin(), ram.end(), 0);
 	set_crom_bank(0xFF);
 	input_bank = serial1 = serial2 = adc_channel = 0;
@@ -460,6 +466,9 @@ void Model3::run_lines(unsigned from, unsigned to)
 
 void Model3::run_frame_start()
 {
+#if defined(VF3_IOS)
+	combat_probe.frame=frame;
+#endif
 	auto exec = [this](int n) {
 		cpu.execute(n);
 		if (after_slice) after_slice();

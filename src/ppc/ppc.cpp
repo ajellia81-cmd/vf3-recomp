@@ -186,6 +186,9 @@ static void report_store(const State &s, uint32_t a, uint32_t v, int bits)
 
 inline void Cpu::w8(uint32_t a, uint8_t v)
 {
+#if defined(VF3_IOS)
+	if (combat_probe && a < 0x800000) combat_probe->observe(ram,a,v,1,s.pc);
+#endif
 	if ((a & ~3u) == watch) report_store(s, a, v, 8);
 	if (a < 0x00800000) {
 		ram[a ^ 3] = v;
@@ -196,6 +199,9 @@ inline void Cpu::w8(uint32_t a, uint8_t v)
 
 inline void Cpu::w16(uint32_t a, uint16_t v)
 {
+#if defined(VF3_IOS)
+	if (combat_probe && a < 0x800000) combat_probe->observe(ram,a,v,2,s.pc);
+#endif
 	if ((a & ~3u) == watch) report_store(s, a, v, 16);
 	if (a < 0x00800000 && !(a & 1)) {
 		*(uint16_t *)&ram[a ^ 2] = v;
@@ -206,6 +212,9 @@ inline void Cpu::w16(uint32_t a, uint16_t v)
 
 inline void Cpu::w32(uint32_t a, uint32_t v)
 {
+#if defined(VF3_IOS)
+	if (combat_probe && a < 0x800000) combat_probe->observe(ram,a,v,4,s.pc);
+#endif
 	if ((a & ~3u) == watch) report_store(s, a, v, 32);
 	if (a < 0x00800000 && !(a & 3)) {
 		*(uint32_t *)&ram[a] = v;
@@ -216,6 +225,9 @@ inline void Cpu::w32(uint32_t a, uint32_t v)
 
 inline void Cpu::w64(uint32_t a, uint64_t v)
 {
+#if defined(VF3_IOS)
+	if (combat_probe && a < 0x800000) combat_probe->observe(ram,a,v,8,s.pc);
+#endif
 	if (a < 0x007FFFF8 && !(a & 3)) {
 		*(uint32_t *)&ram[a] = uint32_t(v >> 32);
 		*(uint32_t *)&ram[a + 4] = uint32_t(v);

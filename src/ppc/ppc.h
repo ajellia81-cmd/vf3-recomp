@@ -7,6 +7,9 @@
 // such place (search for "Reference:").
 #pragma once
 #include <cstdint>
+#if defined(VF3_IOS)
+#include "combat_diagnostics.h"
+#endif
 
 namespace ppc {
 
@@ -83,6 +86,9 @@ class Cpu
 {
 public:
 	State s{};
+#if defined(VF3_IOS)
+	vf3_diagnostics::Probe *combat_probe=nullptr;
+#endif
 	char fatal_message[160] = {};
 	uint32_t watch = 0xFFFFFFFF;  // debugging: report stores to this word (vf3run --watch)
 	uint32_t trace_pc = 0xFFFFFFFF;   // debugging: report r3-r8 and LR each time this instruction runs (vf3run --trace-pc)

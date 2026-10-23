@@ -109,6 +109,9 @@ class Model3 : public ppc::Bus
 {
 public:
 	ppc::Cpu cpu;
+#if defined(VF3_IOS)
+	vf3_diagnostics::Probe combat_probe;
+#endif
 	Irq irq;
 	Eeprom eeprom;
 	Jtag jtag;
