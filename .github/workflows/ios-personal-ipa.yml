@@ -9,7 +9,7 @@ permissions:
   contents: read
 concurrency:
   group: vf3-personal-build-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   ios:
     if: github.repository == 'ajellia81-cmd/vf3-recomp'
