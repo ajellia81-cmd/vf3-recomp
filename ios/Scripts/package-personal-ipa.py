@@ -17,7 +17,7 @@ assert info['CFBundleIdentifier'] == 'com.ajellia81.vf3recomp'
 assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
 assert info.get('CADisableMinimumFrameDurationOnPhone') is True
 assert info['CFBundleDisplayName'] == 'Virtua Fighter 3'
-assert info['CFBundleVersion'] == '2'
+assert info['CFBundleVersion'] == '3'
 assert info['CFBundleIcons']['CFBundlePrimaryIcon']['CFBundleIconName'] == 'AppIcon'
 assert (app / 'Assets.car').is_file()
 exe = app / info['CFBundleExecutable']

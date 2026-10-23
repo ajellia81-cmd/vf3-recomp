@@ -1,4 +1,4 @@
-# Personal iOS build 3: queued vibration tests, opt-in scalar discovery and inactive-recorder bypass.
+# Personal iOS build 3: verify package metadata matches the tested diagnostic app.
 name: Personal unsigned iOS IPA (Model 3, alternate runner)
 on:
   push:
