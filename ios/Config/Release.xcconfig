@@ -1,5 +1,7 @@
 // Same execution policy in release builds; desktop's SLJIT path is not permitted on iOS.
 #include "Debug.xcconfig"
-GCC_OPTIMIZATION_LEVEL = s
+// The interpreter and character/texture preparation are CPU-bound at scene cuts.
+// Keep strict floating-point behavior from Debug.xcconfig; never use fast-math.
+GCC_OPTIMIZATION_LEVEL = 3
 DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
 ENABLE_TESTABILITY = NO
