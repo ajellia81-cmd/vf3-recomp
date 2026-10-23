@@ -1,6 +1,9 @@
-# Manual fallback runner for personal iOS build 2; primary workflow handles pushes.
+# Personal iOS build 3: warmed haptic test and scalar data discovery excluding the program image.
 name: Personal unsigned iOS IPA (Model 3, alternate runner)
 on:
+  push:
+    branches: [ios-port]
+    paths: ['.github/workflows/ios-personal-ipa-alternate.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -27,7 +30,7 @@ jobs:
           path: |
             ios/Dependencies/*.xcframework
             ios/build/licenses
-          key: ios-static-${{ runner.os }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('ios/Dependencies/versions.env', 'ios/Scripts/prepare-dependencies.sh') }}
+          key: ios-static-${{ runner.os }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('ios/Dependencies/versions.env', 'ios/Scripts/prepare-dependencies.sh', 'ios/Scripts/patch-sdl-haptics.py', 'ios/Scripts/ios_rumble_async.inc') }}
       - name: Prepare redistributable libraries only
         if: steps.dependencies.outputs.cache-hit != 'true'
         run: sh ios/Scripts/prepare-dependencies.sh
@@ -59,6 +62,14 @@ jobs:
           ios/build/autosave-check
           xcrun clang++ -std=c++20 -O3 -ffp-contract=off -I"$(brew --prefix sdl3)/include" tools/checks/display_gpu.cpp src/gpu/r3d_gpu.cpp src/video/r3d_raster.cpp src/video/r3d_scene.cpp -L"$(brew --prefix sdl3)/lib" -lSDL3 -o ios/build/display-gpu
           ios/build/display-gpu
+      - name: Test scalar combat discovery and asynchronous vibration without game data
+        run: |
+          xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror -DVF3_IOS=1 -DVF3_DISABLE_JIT=1 -fsanitize=address,undefined tools/checks/combat_diagnostics.cpp src/ppc/ppc.cpp -o ios/build/combat-diagnostics
+          ios/build/combat-diagnostics
+          xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror tools/checks/fight_haptics.cpp -o ios/build/fight-haptics
+          ios/build/fight-haptics
+          xcrun clang -fobjc-arc -fblocks tools/checks/ios_rumble_async.m -framework Foundation -o ios/build/rumble-async
+          ios/build/rumble-async
       - name: Generate and verify interpreter-only project
         run: |
           sh ios/Scripts/preflight.sh
@@ -98,8 +109,8 @@ jobs:
         run: python3 ios/Scripts/package-personal-ipa.py
       - uses: actions/upload-artifact@v4
         with:
-          name: VirtuaFighter3-build2-${{ github.sha }}
-          path: ios/build/personal/VirtuaFighter3-build2-unsigned.ipa
+          name: VirtuaFighter3-build3-${{ github.sha }}
+          path: ios/build/personal/VirtuaFighter3-build3-unsigned.ipa
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
