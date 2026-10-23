@@ -28,3 +28,25 @@ CI does not establish gameplay compatibility, physical iPhone performance,
 120 fps, or LiveContainer behavior. The user must import their own complete
 vf3 Revision D ZIP on-device. No ROM, extracted game data, generated game program,
 JIT or signing secret was downloaded or included. No public release was published.
+
+## Build 2: character transitions and startup overhead
+
+- Source: 4995d6fffe1b5d5bc5ffab263d7aff0101752b8d.
+- Successful Apple build: https://github.com/ajellia81-cmd/vf3-recomp/actions/runs/39899764245
+- Output: VirtuaFighter3-build2-unsigned.ipa (7,832,658 bytes).
+- SHA-256: fb356db29ad4131133344e1580660d48f35f39199f29babaeadfdf5e2770f112.
+
+Release prioritizes speed while preserving strict floating-point behavior.
+Character texture snapshots coalesce repeated dirty rows, and completed audio is
+submitted before scene publication. Hidden boot avoids unnecessary tile drawing
+and per-frame UIKit waits; archive loading and boot times are logged separately.
+The original 960-frame boot and ROM CRC validation remain. See ios/PERFORMANCE.md
+for the measured synthetic result and the limits of repository-side verification.
+
+Apple interpreter state/rounding checks passed at both -Os and -O3, as did the
+sanitized texture coverage test, synthetic Metal/CPU geometry and composition
+checks, controls/autosave/Menu tests, device/simulator builds and two import tests.
+Downloaded archive/IPA integrity, build/source metadata and SHA-256 were verified.
+Actual opening-transition smoothness, audio continuity and launch time on the
+player's phone have not been measured. Personal unsigned use only, interpreter-only,
+no ROM inclusion; upstream unchanged.
