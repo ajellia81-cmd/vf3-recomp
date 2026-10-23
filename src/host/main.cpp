@@ -93,6 +93,7 @@
 #include "../video/r3d_scene.h"
 #include "../video/r3d_raster.h"
 #include "../video/parallel.h"
+#include "../video/texture_rows.h"
 #include "png.h"
 #include "input_script.h"
 #include "menu.h"
@@ -889,10 +890,9 @@ struct Game
 			view.tex = board.tex_ram;
 			view.uploads.assign(1, m3::Model3::TexUpload{ 0, 0, 2048, 2048 });
 		} else {
-			for (auto &u : ups) {
-				const size_t y0 = u.y & 2047, h = std::min<size_t>(u.h, 2048 - y0);
-				memcpy(view.tex.data() + y0 * 2048, board.tex_ram.data() + y0 * 2048, h * 2048 * sizeof(uint16_t));
-				view.uploads.push_back(u);
+			for (const auto &[y0, h] : video::texture_rows(ups)) {
+				memcpy(view.tex.data() + size_t(y0) * 2048, board.tex_ram.data() + size_t(y0) * 2048, size_t(h) * 2048 * sizeof(uint16_t));
+				view.uploads.push_back({0, y0, 2048, h});
 			}
 			if (view.uploads.size() > 512) view.uploads.assign(1, m3::Model3::TexUpload{ 0, 0, 2048, 2048 });
 		}
@@ -1069,7 +1069,10 @@ static int run_game(int argc, char **argv, bool &quit_application)
 	static Game game;   // (large: not on the stack)
 	{
 		std::string err;
+		const auto load_t0 = std::chrono::steady_clock::now();
 		if (!game.load(zip, err, arg_interp)) return fail(err);
+		fprintf(stderr, "startup: archive validation and board loading %.2f s\n",
+			std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
 	}
 	m3::Model3 &board = game.board;
 	const std::string backup_path = data + "/backup", eeprom_path = data + "/eeprom";
@@ -1106,13 +1109,22 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		game.program_changed();
 	};
 	auto boot = [&] {
+		const auto boot_t0 = std::chrono::steady_clock::now();
 		apply_play_style();
 		game.reset();
 		// The PC way plays free: the arcade's coin setting is kept (settings.ini's arcade_coins) before FREE PLAY
 		// replaces it, and the arcade way gives it back (as VF1's and VF2's). A board that has never run writes its
 		// settings in its first frames, so those run first. FREE PLAY the player chose in the test menu, with none
 		// kept, stays.
-		for (int i = 0; i < 300 && board.coin_setting() < 0; i++) board.run_frame();
+		const bool old_tiles_on = game.tiles_on;
+		game.tiles_on = false; // No picture is shown during settings initialization either.
+		for (int i = 0; i < 300 && board.coin_setting() < 0; i++) {
+			board.run_frame();
+#if defined(VF3_IOS)
+			ios_service_events();
+#endif
+		}
+		game.tiles_on = old_tiles_on;
 		if (const int coin = board.coin_setting(); coin >= 0) {
 			int keep = cfg.arcade_coin;
 			if (g_pc_mode) {
@@ -1142,6 +1154,8 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		game.tiles_on = true;
 		fprintf(stderr, "boot: %llu frames in %.2f s, unseen\n", (unsigned long long)game_frame,
 				std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+		fprintf(stderr, "startup: settings initialization and hidden boot %.2f s\n",
+			std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_t0).count());
 	};
 #ifndef VF3_IOS
 	boot();
@@ -2690,6 +2704,10 @@ static int run_game(int argc, char **argv, bool &quit_application)
 				half = false;
 				pass_kind = std::max(pass_kind, 2);
 			} else { game.run_frame(!ff, true); pass_kind = 3; }
+			// Submit the completed sound before copying scenes/textures at a cut.
+			// The audio thread can play it while publication and drawing continue.
+			if (audio && !game.audio.empty() && !ff && rec.dir.empty())
+				SDL_PutAudioStreamData(audio, game.audio.data(), int(game.audio.size() * sizeof(int16_t)));
 			game.publish();
 			game_frame++;
 			pace.frames++;
@@ -2704,8 +2722,6 @@ static int run_game(int argc, char **argv, bool &quit_application)
 				fwrite(game.audio.data(), sizeof(int16_t), game.audio.size(), rec.wav);
 				rec.wav_bytes += uint32_t(game.audio.size() * sizeof(int16_t));
 			}
-			if (audio && !game.audio.empty() && !ff && rec.dir.empty())   // (recording: to its file only, not queued for hours)
-				SDL_PutAudioStreamData(audio, game.audio.data(), int(game.audio.size() * sizeof(int16_t)));
 			game.audio.clear();
 			for (auto &k : test_keys) if (k.second == game_frame) { send_key(k.first); window_shots.push_back(game_frame + 3); }
 			if (quit_after >= 0 && int64_t(game_frame) >= quit_after) running = false;

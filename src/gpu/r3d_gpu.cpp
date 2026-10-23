@@ -9,6 +9,7 @@
 #include "r3d_gpu.h"
 #include "r3d_shaders.h"
 #include "../machine/model3.h"
+#include "../video/texture_rows.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -345,20 +346,7 @@ bool R3dGpu::render(const video::Scene &scene, const video::Raster &prep, const 
 	const uint32_t dbytes = uint32_t(std::max<size_t>(1, gd.size()) * sizeof(GDraw));
 	const uint32_t pbytes = uint32_t(gv.size() * sizeof(GVp));
 	// texture RAM: whole rows of the areas written (all of it the first time, or after many changes)
-	std::vector<std::pair<uint32_t, uint32_t>> rows;   // first row, count
-	if (texram_full || tex_uploads.size() > 256) {
-		rows.push_back({ 0, 2048 });
-	} else {
-		for (auto &u : tex_uploads) rows.push_back({ u.y & 2047, std::min<uint32_t>(u.h, 2048 - (u.y & 2047)) });
-		std::sort(rows.begin(), rows.end());
-		std::vector<std::pair<uint32_t, uint32_t>> merged;
-		for (auto &r : rows) {
-			if (!merged.empty() && r.first <= merged.back().first + merged.back().second)
-				merged.back().second = std::max(merged.back().second, r.first + r.second - merged.back().first);
-			else merged.push_back(r);
-		}
-		rows = merged;
-	}
+	const auto rows = video::texture_rows(tex_uploads, texram_full);
 	// (the rows asked for are taken now; if a step below fails, the whole of texture memory goes up next time)
 	tex_uploads.clear();
 	texram_full = true;

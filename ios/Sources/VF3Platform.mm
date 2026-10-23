@@ -81,4 +81,5 @@ void ios_safe_area(SDL_Window *window, float &left, float &top, float &right, fl
 	right = insets.right * density; bottom = insets.bottom * density;
 }
 
-void ios_service_events(){SDL_PumpEvents(); CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.001,true);}
+// Service pending UIKit work without adding a 1 ms sleep to every hidden boot frame.
+void ios_service_events(){SDL_PumpEvents(); CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.0,true);}
