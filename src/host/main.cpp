@@ -101,6 +101,7 @@
 #if defined(VF3_IOS)
 #include "ios_platform.h"
 #include "ios_input.h"
+#include "ios_fight_haptics.h"
 #endif
 #include "display_color.h"
 #include "controls.h"
@@ -442,6 +443,7 @@ struct settings
 	bool upgraded = false;   // (an upgrade made as it was read: saved at once)
 	bool pads_swapped=false;
 	int ios_resolution=0, brightness=100;
+	int haptic_strength=75, haptic_players=1;
 	int scale = 0, aspect = 0, volume = 100, renderer3d = 2;   // renderer3d: 0 the CPU, 1 the GPU, 2 Auto
 	int music = 100, effects = 100;   // within the volume
 	int arcade_coin = -2;   // the arcade way's coin setting, while the PC way's FREE PLAY replaces it (-1 none to give back, -2 none kept yet)
@@ -491,6 +493,7 @@ struct settings
 		flag("sharp_textures", sharp_textures);
 		num("screen_filter", filter, 0, 2);
 		num("ios_resolution",ios_resolution,0,6); num("brightness",brightness,50,200);
+		num("haptic_strength",haptic_strength,0,100); num("haptic_players",haptic_players,1,3);
 		num("crt_colours", crt_colours, 0, 5);
 		num("graphics", graphics, 0, 1);
 		num("antialiasing", aa, 0, 3);
@@ -544,6 +547,7 @@ struct settings
 		fprintf(f, "crt_colours = %d\nsharp_textures = %d\n", crt_colours, int(sharp_textures));
 		if (graphics) fprintf(f, "graphics = %d\n", graphics);
 		fprintf(f,"ios_resolution = %d\nbrightness = %d\n",ios_resolution,brightness);
+		fprintf(f,"haptic_strength = %d\nhaptic_players = %d\n",haptic_strength,haptic_players);
 		fprintf(f, "screen_filter = %d\nantialiasing = %d\nmusic_volume = %d\neffects_volume = %d\narcade_coins = %d\nframe_timings = %d\n", filter, aa, music, effects, arcade_coin, int(timings));
 		for (int p = 0; p < 2; p++) ctl[p].save(f, p);
 		const bool flushed = flush_to_disk(f);
@@ -1898,6 +1902,10 @@ static int run_game(int argc, char **argv, bool &quit_application)
 
 	// ---- pads ----
 	SDL_Gamepad *pads[2] = { nullptr, nullptr };
+#if defined(VF3_IOS)
+	ios_fight_haptics feedback; bool ios_background=false;
+	ios_haptics_prepare();
+#endif
 	bool &pads_swapped = cfg.pads_swapped;
 	auto guid_of = [](SDL_JoystickID id) {
 		char buf[64];
@@ -1905,6 +1913,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		return std::string(buf);
 	};
 	auto open_pads = [&] {
+#if defined(VF3_IOS)
+		feedback.stop(pads);
+#endif
 		for (auto &p : pads) if (p) { SDL_CloseGamepad(p); p = nullptr; }
 		int n = 0;
 		SDL_JoystickID *ids = SDL_GetGamepads(&n);
@@ -2019,6 +2030,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 	bool half_left = false;
 	uint64_t half_ns = 0;   // (its first half's time, counted with the frame's)
 	auto reset_game = [&] {
+#if defined(VF3_IOS)
+		feedback.stop(pads);
+#endif
 		half = false;
 		menu.close();   // (back to the game, as VF1's and VF2's)
 		paused = false;
@@ -2303,8 +2317,50 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		pg.items.push_back(back_item());
 		return pg;
 	};
+#if defined(VF3_IOS)
+ int diagnostic_player=0;
+ std::string diagnostic_status="Start a search before the selected player takes damage.";
+ auto diagnostic_wait = [&] { if(game.emu_thread.joinable())game.job_wait(); };
+ auto diagnostic_page = [&] {
+  menu_page pg{"Combat diagnostics","Automatic hit vibration awaits verified Revision D mapping.",{}};
+  pg.items.push_back({"Status","Unverified candidates only. Narrow to 8 or fewer per player to record stores.",
+   [&]{return diagnostic_status;},{},{}});
+  pg.items.push_back({"Test vibration","One short test on the selected pad, or the phone fallback. No automatic hit feedback yet.",{},{},
+   [&]{feedback.test(pads,cfg.haptic_players,cfg.haptic_strength);}});
+  pg.items.push_back({"Test strength","Overall vibration test intensity.",[&]{return std::to_string(cfg.haptic_strength)+"%";},
+   [&](int d){cfg.haptic_strength=std::clamp(cfg.haptic_strength+10*d,0,100);cfg_dirty=true;}});
+  pg.items.push_back({"Test players","Assigned controller sides; the shared phone follows P1 unless only P2 is selected.",
+   [&]{return cfg.haptic_players==3?"Both":cfg.haptic_players==2?"Player 2":"Player 1";},
+   [&](int d){cfg.haptic_players=1+(cfg.haptic_players-1+d+3)%3;cfg_dirty=true;feedback.stop(pads);}});
+  pg.items.push_back({"Search target","Select the player whose health you will reduce.",
+   [&]{return diagnostic_player?"Player 2":"Player 1";},[&](int){diagnostic_player^=1;}});
+  auto report_candidates=[&]{
+   auto &q=board.combat_probe.searches[diagnostic_player];
+   diagnostic_status=q.overflow?"Search overflow; no candidates armed.":!q.started?"Start a search first.":
+    "P"+std::to_string(diagnostic_player+1)+": "+std::to_string(q.candidates.size())+" candidates; "+std::to_string(board.combat_probe.watched())+" watched.";
+  };
+  pg.items.push_back({"Start health search","Before a hit in a fresh round: collect plausible scalar integer fields. Replaces this player's old search.",{},{},
+   [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].start(board.ram);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
+  pg.items.push_back({"Keep decreased values","Resume, let ONLY the selected player take damage, then reopen this menu and select this. Repeat until 8 or fewer remain.",{},{},
+   [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].refine(board.ram,true);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
+  pg.items.push_back({"Keep unchanged values","Resume briefly without damage to the selected player, then use this to discard timers and other moving values.",{},{},
+   [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].refine(board.ram,false);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
+  pg.items.push_back({"Scene label","Manual label for future observations; does not claim an automatic scene detector.",
+   [&]{return std::string(vf3_diagnostics::phase_name(board.combat_probe.phase));},
+   [&](int d){diagnostic_wait();auto &phase=board.combat_probe.phase;phase=vf3_diagnostics::Phase((unsigned(phase)+d+5)%5);}});
+  pg.items.push_back({"Save hit diagnostics","Save only narrowed candidates and scalar store events to haptics-hit-diagnostics.csv in the app data folder.",{},{},
+   [&]{diagnostic_wait();bool ok=board.combat_probe.save((data+"/haptics-hit-diagnostics.csv").c_str(),board.ram);
+    diagnostic_status=ok?"Saved haptics-hit-diagnostics.csv":"Save failed.";menu.refresh();}});
+  pg.items.push_back({"Clear diagnostics","Disarm all watches and discard this session's scalar observations.",{},{},
+   [&]{diagnostic_wait();board.combat_probe.clear();diagnostic_status="Cleared. Start a new health search.";menu.refresh();}});
+  pg.items.push_back(back_item());return pg;
+ };
+#endif
 	auto controls_page = [&] {
 		menu_page pg{ "Controls", "", {} };
+#if defined(VF3_IOS)
+		pg.items.push_back({"Combat diagnostics","Test vibration and identify Revision D hit events.",{},{},[&]{menu.push(diagnostic_page());}});
+#endif
 		pg.items.push_back({ "Player 1", "Player 1's controller, keys and buttons.", [&] { return pad_name(0); }, {},
 							 [&] { menu.push(player_page(0)); } });
 		pg.items.push_back({ "Player 2", "Player 2's controller, keys and buttons.", [&] { return pad_name(1); }, {},
@@ -2342,7 +2398,11 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		sound_paused = menu.is_open();
 		if (sound_paused) SDL_PauseAudioStreamDevice(audio); else SDL_ResumeAudioStreamDevice(audio);
 	};
-	auto open_menu = [&] { if (game.emu_thread.joinable()) game.job_wait(); if (menu.ready() && !menu.is_open()) menu.open(main_page()); sync_menu_sound(); };
+	auto open_menu = [&] {
+#if defined(VF3_IOS)
+		feedback.stop(pads);
+#endif
+		if (game.emu_thread.joinable()) game.job_wait(); if (menu.ready() && !menu.is_open()) menu.open(main_page()); sync_menu_sound(); };
 #if defined(VF3_IOS)
 	struct background_save {
 		std::function<void()> fn;
@@ -2355,6 +2415,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		~background_save(){stop();}
 	} lifecycle{[&]{
 		if(game.emu_thread.joinable())game.job_wait();
+		ios_background=true; feedback.stop(pads); ios_haptics_suspend();
 		ios_input_reset();saver.flush();
 		save_blob(backup_path,board.backup.data(),board.backup.size());
 		save_blob(eeprom_path,board.eeprom.regs,sizeof(board.eeprom.regs));
@@ -2498,6 +2559,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		SDL_Event e;
 		while (SDL_PollEvent(&e)) {
 			if (e.type == SDL_EVENT_QUIT) running = false;
+#if defined(VF3_IOS)
+			if(e.type==SDL_EVENT_DID_ENTER_FOREGROUND){ios_background=false;ios_haptics_prepare();}
+#endif
 			if (e.type == SDL_EVENT_RENDER_DEVICE_RESET || e.type == SDL_EVENT_RENDER_TARGETS_RESET) textures_lost(e.type == SDL_EVENT_RENDER_DEVICE_RESET);
 			if (e.type == SDL_EVENT_RENDER_DEVICE_LOST) { fprintf(stderr, "the graphics device was lost: closing\n"); running = false; }
 			if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMOVED) { open_pads(); menu.refresh(); }
@@ -2569,6 +2633,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		if (clock_reset) { clock_reset = false; frames_run = 0; restart_clock_real(); new_frame = true; }
 		const bool stopped = paused || menu.is_open();
 		const bool ff = !stopped && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_TAB];
+#if defined(VF3_IOS)
+		feedback.sync(pads,stopped || ff || ios_background);
+#endif
 		int due = 0;
 		if (stopped) {
 			pace.stopped_s += double(SDL_GetTicksNS() - clock_t) / 1e9;   // (the menu's time isn't the game's)
@@ -2990,6 +3057,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
 	rec_stop();
 	if (cfg_dirty && quit_after < 0) cfg.save(settings_path);
 	if (audio) SDL_DestroyAudioStream(audio);
+	#if defined(VF3_IOS)
+	feedback.stop(pads);ios_haptics_shutdown();
+#endif
 	for (auto &p : pads) if (p) SDL_CloseGamepad(p);
 	menu_owner.reset();
 	if (g3.tex) SDL_DestroyTexture(g3.tex);
