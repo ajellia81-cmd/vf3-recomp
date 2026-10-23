@@ -1,4 +1,4 @@
-# Personal iOS build 3: verify package metadata matches the tested diagnostic app.
+# Personal iOS build 3: use macOS 15 after macOS 26 jobs expired without a runner.
 name: Personal unsigned iOS IPA (Model 3, alternate runner)
 on:
   push:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   ios:
     if: github.repository == 'ajellia81-cmd/vf3-recomp'
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
