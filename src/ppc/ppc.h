@@ -9,6 +9,7 @@
 #include <cstdint>
 #if defined(VF3_IOS)
 #include "combat_diagnostics.h"
+#include "combat_feedback.h"
 #endif
 
 namespace ppc {
@@ -88,6 +89,7 @@ public:
 	State s{};
 #if defined(VF3_IOS)
 	vf3_diagnostics::Probe *combat_probe=nullptr;
+	vf3_feedback::Contacts *combat_feedback=nullptr;
 #endif
 	char fatal_message[160] = {};
 	uint32_t watch = 0xFFFFFFFF;  // debugging: report stores to this word (vf3run --watch)

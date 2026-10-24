@@ -2322,14 +2322,20 @@ static int run_game(int argc, char **argv, bool &quit_application)
  std::string diagnostic_status="Start a search before the selected player takes damage.";
  auto diagnostic_wait = [&] { if(game.emu_thread.joinable())game.job_wait(); };
  auto diagnostic_page = [&] {
-  menu_page pg{"Combat diagnostics","Automatic hit vibration awaits verified Revision D mapping.",{}};
+  menu_page pg{"Combat diagnostics","Contact preview: manually arm each round. Automatic live/demo detection is not verified.",{}};
   pg.items.push_back({"Status","Unverified candidates only. Narrow to 8 or fewer per player to record stores.",
    [&]{return diagnostic_status;},{},{}});
-  pg.items.push_back({"Test vibration","One short test on the selected pad, or the phone fallback. No automatic hit feedback yet.",{},{},
+  pg.items.push_back({"Round contact vibration","Arm ONLY in a real fight with both full health bars. Automatically disarms at another health writer, reset, background or timeout. Do not arm in demos.",
+   [&]{return board.combat_feedback.armed()?"Armed for this round":"Off";},{},
+   [&]{diagnostic_wait();feedback.stop(pads);
+    if(board.combat_feedback.armed()) {board.combat_feedback.stop();diagnostic_status="Contact preview off.";}
+    else diagnostic_status=board.combat_feedback.arm(board.ram,board.frame)?"Armed. Resume this round; re-arm next round.":"Arm at round start with both health bars full and equal.";
+    menu.refresh();}});
+  pg.items.push_back({"Test vibration","One short test on the selected pad, or the phone fallback. Round contact preview is separately armed.",{},{},
    [&]{feedback.test(pads,cfg.haptic_players,cfg.haptic_strength);}});
-  pg.items.push_back({"Test strength","Overall vibration test intensity.",[&]{return std::to_string(cfg.haptic_strength)+"%";},
+  pg.items.push_back({"Vibration strength","Overall test and contact vibration intensity.",[&]{return std::to_string(cfg.haptic_strength)+"%";},
    [&](int d){cfg.haptic_strength=std::clamp(cfg.haptic_strength+10*d,0,100);cfg_dirty=true;}});
-  pg.items.push_back({"Test players","Assigned controller sides; the shared phone follows P1 unless only P2 is selected.",
+  pg.items.push_back({"Vibration players","Assigned controller sides; the shared phone follows P1 unless only P2 is selected.",
    [&]{return cfg.haptic_players==3?"Both":cfg.haptic_players==2?"Player 2":"Player 1";},
    [&](int d){cfg.haptic_players=1+(cfg.haptic_players-1+d+3)%3;cfg_dirty=true;feedback.stop(pads);}});
   pg.items.push_back({"Search target","Select the player whose health you will reduce.",
@@ -2422,7 +2428,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		~background_save(){stop();}
 	} lifecycle{[&]{
 		if(game.emu_thread.joinable())game.job_wait();
-		ios_background=true; feedback.stop(pads); ios_haptics_suspend();
+		ios_background=true; feedback.stop(pads); board.combat_feedback.stop(); ios_haptics_suspend();
 		ios_input_reset();saver.flush();
 		save_blob(backup_path,board.backup.data(),board.backup.size());
 		save_blob(eeprom_path,board.eeprom.regs,sizeof(board.eeprom.regs));
@@ -2718,7 +2724,11 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		}
 		// the inputs the game reads during a frame, set before it starts (or its first half)
 		auto frame_inputs = [&](hotkey &hk, InputScript::Actions &act, bool &left_test) {
-				// the inputs the game reads during the next frame: the script's, then the player's
+				#if defined(VF3_IOS)
+                // Seed after any menu pause before starting the emulation worker.
+                feedback.frame(board.combat_feedback.snapshot(board.ram,board.frame),pads,true,ff || ios_background,cfg.haptic_players,cfg.haptic_strength);
+#endif
+                // the inputs the game reads during the next frame: the script's, then the player's
 				m3::Controls live;
 				hk = read_inputs(live, pads, pstate, cfg.ctl);
 				act = InputScript::Actions();
@@ -2783,6 +2793,10 @@ static int run_game(int argc, char **argv, bool &quit_application)
 			if (audio && !game.audio.empty() && !ff && rec.dir.empty())
 				SDL_PutAudioStreamData(audio, game.audio.data(), int(game.audio.size() * sizeof(int16_t)));
 			game.publish();
+#if defined(VF3_IOS)
+            if(in_test || ios_background || ff)board.combat_feedback.stop();
+            feedback.frame(board.combat_feedback.snapshot(board.ram,board.frame),pads,true,ff || ios_background || in_test,cfg.haptic_players,cfg.haptic_strength);
+#endif
 			game_frame++;
 			pace.frames++;
 			pace.emu_ms += double(SDL_GetTicksNS() - te) / 1e6;

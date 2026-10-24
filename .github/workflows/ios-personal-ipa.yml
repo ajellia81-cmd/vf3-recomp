@@ -1,4 +1,4 @@
-# Personal iOS build 4: identified health preset and empty-export guard.
+# Personal iOS build 5: explicit single-round contact preview; no automatic live/demo gate.
 name: Personal unsigned iOS IPA (Model 3)
 on:
   push:
@@ -66,6 +66,8 @@ jobs:
         run: |
           xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror -DVF3_IOS=1 -DVF3_DISABLE_JIT=1 -fsanitize=address,undefined tools/checks/combat_diagnostics.cpp src/ppc/ppc.cpp -o ios/build/combat-diagnostics
           ios/build/combat-diagnostics
+          xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror -DVF3_IOS=1 -DVF3_DISABLE_JIT=1 -fsanitize=address,undefined tools/checks/combat_feedback.cpp src/ppc/ppc.cpp -o ios/build/combat-feedback
+          ios/build/combat-feedback
           xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror tools/checks/fight_haptics.cpp -o ios/build/fight-haptics
           ios/build/fight-haptics
           xcrun clang -fobjc-arc -fblocks tools/checks/ios_rumble_async.m -framework Foundation -o ios/build/rumble-async
@@ -109,8 +111,8 @@ jobs:
         run: python3 ios/Scripts/package-personal-ipa.py
       - uses: actions/upload-artifact@v4
         with:
-          name: VirtuaFighter3-build4-${{ github.sha }}
-          path: ios/build/personal/VirtuaFighter3-build4-unsigned.ipa
+          name: VirtuaFighter3-build5-${{ github.sha }}
+          path: ios/build/personal/VirtuaFighter3-build5-unsigned.ipa
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
