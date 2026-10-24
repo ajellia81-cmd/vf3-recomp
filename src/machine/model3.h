@@ -110,7 +110,6 @@ class Model3 : public ppc::Bus
 public:
 	ppc::Cpu cpu;
 #if defined(VF3_IOS)
-	vf3_diagnostics::Probe combat_probe;
 	vf3_feedback::Contacts combat_feedback;
 #endif
 	Irq irq;

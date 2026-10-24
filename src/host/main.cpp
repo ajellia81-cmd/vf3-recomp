@@ -443,6 +443,7 @@ struct settings
 	bool upgraded = false;   // (an upgrade made as it was read: saved at once)
 	bool pads_swapped=false;
 	int ios_resolution=0, brightness=100;
+	bool haptic_enabled=true;
 	int haptic_strength=75, haptic_players=1;
 	int scale = 0, aspect = 0, volume = 100, renderer3d = 2;   // renderer3d: 0 the CPU, 1 the GPU, 2 Auto
 	int music = 100, effects = 100;   // within the volume
@@ -493,7 +494,7 @@ struct settings
 		flag("sharp_textures", sharp_textures);
 		num("screen_filter", filter, 0, 2);
 		num("ios_resolution",ios_resolution,0,6); num("brightness",brightness,50,200);
-		num("haptic_strength",haptic_strength,0,100); num("haptic_players",haptic_players,1,3);
+		flag("haptic_enabled",haptic_enabled); num("haptic_strength",haptic_strength,0,100); num("haptic_players",haptic_players,1,3);
 		num("crt_colours", crt_colours, 0, 5);
 		num("graphics", graphics, 0, 1);
 		num("antialiasing", aa, 0, 3);
@@ -547,6 +548,7 @@ struct settings
 		fprintf(f, "crt_colours = %d\nsharp_textures = %d\n", crt_colours, int(sharp_textures));
 		if (graphics) fprintf(f, "graphics = %d\n", graphics);
 		fprintf(f,"ios_resolution = %d\nbrightness = %d\n",ios_resolution,brightness);
+		fprintf(f,"haptic_enabled = %d\n",int(haptic_enabled));
 		fprintf(f,"haptic_strength = %d\nhaptic_players = %d\n",haptic_strength,haptic_players);
 		fprintf(f, "screen_filter = %d\nantialiasing = %d\nmusic_volume = %d\neffects_volume = %d\narcade_coins = %d\nframe_timings = %d\n", filter, aa, music, effects, arcade_coin, int(timings));
 		for (int p = 0; p < 2; p++) ctl[p].save(f, p);
@@ -2317,62 +2319,17 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		pg.items.push_back(back_item());
 		return pg;
 	};
-#if defined(VF3_IOS)
- int diagnostic_player=0;
- std::string diagnostic_status="Start a search before the selected player takes damage.";
- auto diagnostic_wait = [&] { if(game.emu_thread.joinable())game.job_wait(); };
- auto diagnostic_page = [&] {
-  menu_page pg{"Combat diagnostics","Contact preview: manually arm each round. Automatic live/demo detection is not verified.",{}};
-  pg.items.push_back({"Status","Unverified candidates only. Narrow to 8 or fewer per player to record stores.",
-   [&]{return diagnostic_status;},{},{}});
-  pg.items.push_back({"Round contact vibration","Arm ONLY in a real fight with both full health bars. Automatically disarms at another health writer, reset, background or timeout. Do not arm in demos.",
-   [&]{return board.combat_feedback.armed()?"Armed for this round":"Off";},{},
-   [&]{diagnostic_wait();feedback.stop(pads);
-    if(board.combat_feedback.armed()) {board.combat_feedback.stop();diagnostic_status="Contact preview off.";}
-    else diagnostic_status=board.combat_feedback.arm(board.ram,board.frame)?"Armed. Resume this round; re-arm next round.":"Arm at round start with both health bars full and equal.";
-    menu.refresh();}});
-  pg.items.push_back({"Test vibration","One short test on the selected pad, or the phone fallback. Round contact preview is separately armed.",{},{},
-   [&]{feedback.test(pads,cfg.haptic_players,cfg.haptic_strength);}});
-  pg.items.push_back({"Vibration strength","Overall test and contact vibration intensity.",[&]{return std::to_string(cfg.haptic_strength)+"%";},
-   [&](int d){cfg.haptic_strength=std::clamp(cfg.haptic_strength+10*d,0,100);cfg_dirty=true;}});
-  pg.items.push_back({"Vibration players","Assigned controller sides; the shared phone follows P1 unless only P2 is selected.",
-   [&]{return cfg.haptic_players==3?"Both":cfg.haptic_players==2?"Player 2":"Player 1";},
-   [&](int d){cfg.haptic_players=1+(cfg.haptic_players-1+d+3)%3;cfg_dirty=true;feedback.stop(pads);}});
-  pg.items.push_back({"Search target","Select the player whose health you will reduce.",
-   [&]{return diagnostic_player?"Player 2":"Player 1";},[&](int){diagnostic_player^=1;}});
-  auto report_candidates=[&]{
-   auto &q=board.combat_probe.searches[diagnostic_player];
-   diagnostic_status=q.overflow?"Search overflow; no candidates armed.":!q.started?"Start a search first.":
-    "P"+std::to_string(diagnostic_player+1)+": "+std::to_string(q.candidates.size())+" candidates; "+std::to_string(board.combat_probe.watched())+" watched.";
-  };
-  pg.items.push_back({"Watch identified health","Clear the old capture and watch both identified fighter health fields. No search needed. Automatic vibration remains off.",{},{},
-   [&]{diagnostic_wait();bool ok=board.combat_probe.watch_identified_health(board.ram);
-    diagnostic_status=ok?"P1 + P2 health watched. Set label and resume.":"Cannot arm identified fields.";menu.refresh();}});
-  pg.items.push_back({"Start health search","Before a hit in a fresh round: collect plausible scalar integer fields. Replaces this player's old search.",{},{},
-   [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].start(board.ram);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
-  pg.items.push_back({"Keep decreased values","Resume, let ONLY the selected player take damage, then reopen this menu and select this. Repeat until 8 or fewer remain.",{},{},
-   [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].refine(board.ram,true);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
-  pg.items.push_back({"Keep unchanged values","Resume briefly without damage to the selected player, then use this to discard timers and other moving values.",{},{},
-   [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].refine(board.ram,false);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
-  pg.items.push_back({"Scene label","Manual label for future observations; does not claim an automatic scene detector.",
-   [&]{return std::string(vf3_diagnostics::phase_name(board.combat_probe.phase));},
-   [&](int d){diagnostic_wait();auto &phase=board.combat_probe.phase;phase=vf3_diagnostics::Phase((unsigned(phase)+d+5)%5);}});
-  pg.items.push_back({"Save hit diagnostics","Save only narrowed candidates and scalar store events to haptics-hit-diagnostics.csv in the app data folder.",{},{},
-   [&]{diagnostic_wait();
-    if(!board.combat_probe.watched() && !board.combat_probe.size()) {
-     diagnostic_status="Nothing recorded. Choose Watch identified health.";menu.refresh();return;
-    }
-    bool ok=board.combat_probe.save((data+"/haptics-hit-diagnostics.csv").c_str(),board.ram);
-    diagnostic_status=ok?"Saved "+std::to_string(board.combat_probe.size())+" stores; "+std::to_string(board.combat_probe.watched())+" watched.":"Save failed.";menu.refresh();}});
-  pg.items.push_back({"Clear diagnostics","Disarm all watches and discard this session's scalar observations.",{},{},
-   [&]{diagnostic_wait();board.combat_probe.clear();diagnostic_status="Cleared. Start a new health search.";menu.refresh();}});
-  pg.items.push_back(back_item());return pg;
- };
-#endif
+
 	auto controls_page = [&] {
 		menu_page pg{ "Controls", "", {} };
 #if defined(VF3_IOS)
-		pg.items.push_back({"Combat diagnostics","Test vibration and identify Revision D hit events.",{},{},[&]{menu.push(diagnostic_page());}});
+		pg.items.push_back({"Vibration","Automatic contact feedback each round; KO follow-up hits use maximum ordinary intensity.",
+            [&]{return cfg.haptic_enabled?"On":"Off";},[&](int){cfg.haptic_enabled=!cfg.haptic_enabled;cfg_dirty=true;feedback.stop(pads);}});
+        pg.items.push_back({"Vibration strength","Overall vibration intensity.",[&]{return std::to_string(cfg.haptic_strength)+"%";},
+            [&](int d){cfg.haptic_strength=std::clamp(cfg.haptic_strength+10*d,0,100);cfg_dirty=true;}});
+        pg.items.push_back({"Vibration players","Controller sides; shared phone follows P1 unless only P2 is selected.",
+            [&]{return cfg.haptic_players==3?"Both":cfg.haptic_players==2?"Player 2":"Player 1";},
+            [&](int d){cfg.haptic_players=1+(cfg.haptic_players-1+d+3)%3;cfg_dirty=true;feedback.stop(pads);}});
 #endif
 		pg.items.push_back({ "Player 1", "Player 1's controller, keys and buttons.", [&] { return pad_name(0); }, {},
 							 [&] { menu.push(player_page(0)); } });
@@ -2428,7 +2385,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		~background_save(){stop();}
 	} lifecycle{[&]{
 		if(game.emu_thread.joinable())game.job_wait();
-		ios_background=true; feedback.stop(pads); board.combat_feedback.stop(); ios_haptics_suspend();
+		ios_background=true; feedback.stop(pads); ios_haptics_suspend();
 		ios_input_reset();saver.flush();
 		save_blob(backup_path,board.backup.data(),board.backup.size());
 		save_blob(eeprom_path,board.eeprom.regs,sizeof(board.eeprom.regs));
@@ -2647,7 +2604,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		const bool stopped = paused || menu.is_open();
 		const bool ff = !stopped && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_TAB];
 #if defined(VF3_IOS)
-		feedback.sync(pads,stopped || ff || ios_background);
+		feedback.sync(pads,stopped || ff || ios_background || !cfg.haptic_enabled);
 #endif
 		int due = 0;
 		if (stopped) {
@@ -2726,7 +2683,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 		auto frame_inputs = [&](hotkey &hk, InputScript::Actions &act, bool &left_test) {
 				#if defined(VF3_IOS)
                 // Seed after any menu pause before starting the emulation worker.
-                feedback.frame(board.combat_feedback.snapshot(board.ram,board.frame),pads,true,ff || ios_background,cfg.haptic_players,cfg.haptic_strength);
+                feedback.frame(board.combat_feedback.snapshot(board.ram,board.frame),pads,cfg.haptic_enabled,ff || ios_background,cfg.haptic_players,cfg.haptic_strength);
 #endif
                 // the inputs the game reads during the next frame: the script's, then the player's
 				m3::Controls live;
@@ -2795,7 +2752,7 @@ static int run_game(int argc, char **argv, bool &quit_application)
 			game.publish();
 #if defined(VF3_IOS)
             if(in_test || ios_background || ff)board.combat_feedback.stop();
-            feedback.frame(board.combat_feedback.snapshot(board.ram,board.frame),pads,true,ff || ios_background || in_test,cfg.haptic_players,cfg.haptic_strength);
+            feedback.frame(board.combat_feedback.snapshot(board.ram,board.frame),pads,cfg.haptic_enabled,ff || ios_background || in_test,cfg.haptic_players,cfg.haptic_strength);
 #endif
 			game_frame++;
 			pace.frames++;

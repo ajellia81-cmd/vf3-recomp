@@ -36,9 +36,4 @@ public:
 		for (int p = 0; p < 2; ++p) play(pads, p, pulses[p], selected);
 		if (!s.live) stop(pads);
 	}
-	void test(SDL_Gamepad *const pads[2], unsigned selected, int strength) {
-		stop(pads);
-		const float gain = std::clamp(strength, 0, 100) / 100.0f;
-		for (int p = 0; p < 2; ++p) if (selected & (1u << p)) play(pads, p, {0.6f * gain, 0.8f * gain, 100, false}, selected);
-	}
 };

@@ -17,13 +17,17 @@ assert info['CFBundleIdentifier'] == 'com.ajellia81.vf3recomp'
 assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
 assert info.get('CADisableMinimumFrameDurationOnPhone') is True
 assert info['CFBundleDisplayName'] == 'Virtua Fighter 3'
-assert info['CFBundleVersion'] == '6'
+assert info['CFBundleVersion'] == '7'
 assert info['CFBundleIcons']['CFBundlePrimaryIcon']['CFBundleIconName'] == 'AppIcon'
 assert (app / 'Assets.car').is_file()
 exe = app / info['CFBundleExecutable']
 assert subprocess.check_output(['xcrun', 'lipo', '-archs', str(exe)], text=True).strip() == 'arm64'
 symbols = subprocess.check_output(['xcrun', 'nm', str(exe)], text=True)
 assert 'sljit_' not in symbols, 'JIT symbols must never enter the iOS package'
+binary = exe.read_bytes()
+for marker in (b'Combat diagnostics', b'Test vibration', b'Save hit diagnostics', b'Start health search', b'haptics-hit-diagnostics.csv'):
+    assert marker not in binary, f'Diagnostic UI/export remains: {marker!r}'
+assert 'vf3_diagnostics' not in symbols, 'Diagnostic recorder symbols remain'
 for file in app.rglob('*'):
     assert file.suffix.lower() not in {'.zip', '.bin', '.rom', '.ipa'}, f'Unexpected game/archive data: {file}'
     assert file.name != 'embedded.mobileprovision', 'Personal signing happens after download'
@@ -59,9 +63,9 @@ sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True)
 (staged / 'BUILD-INFO.json').write_text(json.dumps({
     'source_commit': sha, 'execution': 'interpreter-only', 'presentation_target': [2868,1320], 'output_source_raster_scale': 4, 'selectable_integer_scales': [1, 2, 3, 4, 5, 6], 'brightness_range_percent': [50, 200],
     'signed': False, 'roms_included': False, 'purpose': 'personal use; re-sign before installation',
-    'gameplay_device_tested': False, 'automatic_combat_haptics': False, 'manual_round_contact_preview': True, 'post_ko_contact_profile': 'maximum ordinary impact; obey overall gain; no KO tail', 'automatic_live_demo_gate_verified': False, 'combat_diagnostics_schema': 2, 'identified_health_watch_preset': True,
+    'gameplay_device_tested': False, 'automatic_combat_haptics': True, 'manual_round_contact_preview': False, 'post_ko_contact_profile': 'maximum ordinary impact; obey overall gain; no KO tail', 'automatic_live_demo_gate_verified': False, 'combat_diagnostics': False, 'round_activation': 'verified full-health refill pair',
 }, indent=2) + '\n')
-ipa = out / 'VirtuaFighter3-build6-unsigned.ipa'
+ipa = out / 'VirtuaFighter3-build7-clean-unsigned.ipa'
 subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', 'Payload', ipa.name], cwd=out, check=True)
 with zipfile.ZipFile(ipa) as z:
     assert z.testzip() is None

@@ -382,7 +382,6 @@ bool Model3::load(const std::string &zip, std::string &error)
 	tex_ram.assign(2048 * 2048, 0);
 	cpu.attach(this, ram.data(), crom.data());
 #if defined(VF3_IOS)
-	cpu.combat_probe=&combat_probe;
 	cpu.combat_feedback=&combat_feedback;
 #endif
 	// Step 1.0: a 66 MHz 603e on a 66 MHz bus (multiplier 1.0); the reference's PVR and HID1 for it
@@ -396,8 +395,7 @@ bool Model3::load(const std::string &zip, std::string &error)
 void Model3::reset()
 {
 #if defined(VF3_IOS)
-	combat_probe.clear();
-	combat_feedback.stop();
+	combat_feedback.reset();
 #endif
 	std::fill(ram.begin(), ram.end(), 0);
 	set_crom_bank(0xFF);
@@ -469,7 +467,6 @@ void Model3::run_lines(unsigned from, unsigned to)
 void Model3::run_frame_start()
 {
 #if defined(VF3_IOS)
-	combat_probe.frame=frame;
 	combat_feedback.tick(frame);
 #endif
 	auto exec = [this](int n) {
