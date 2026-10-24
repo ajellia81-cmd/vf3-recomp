@@ -21,5 +21,26 @@ int main() {
 	s.frame += 3; s.health[0] -= 10; assert(!tracker.advance(s, 3, 100)[0].ms);
 	s.frame++; s.epoch++; s.health[0] -= 10; assert(!tracker.advance(s, 3, 100)[0].ms);
 	s.frame++; s.health[1] = -1; assert(!tracker.advance(s, 3, 100)[0].ms);
+	// Post-KO only: strongest ordinary profile, not another decisive-KO tail.
+	for (int maximum : {120,181,200,240}) for (int victim=0;victim<2;++victim)
+	for (int gain : {0,25,75,100}) for (unsigned selected : {1u,2u,3u}) {
+		Tracker t; Snapshot z; z.frame=1;z.live=true;z.maximum=maximum;
+		z.health[0]=z.health[1]=maximum;z.health[victim]=0;z.damage_events=true;
+		t.advance(z,selected,gain);
+		z.frame++;z.contact_total[victim]++;
+		auto p=t.advance(z,selected,gain);const float g=gain/100.0f;
+		auto near=[](float a,float b){return std::fabs(a-b)<0.00001f;};
+		for(int player=0;player<2;++player) {
+			if(!(selected&(1u<<player))) {assert(!p[player].ms);continue;}
+			const bool received=player==victim;
+			assert(near(p[player].low,(received?0.90f:0.52f)*g));
+			assert(near(p[player].high,(received?0.65f:0.90f)*g));
+			assert(p[player].ms==(received?100u:65u) && !p[player].knockout);
+		}
+		assert(!t.advance(z,selected,gain)[0].ms);
+		z.frame++;auto nohit=t.advance(z,selected,gain);
+		assert(!nohit[0].ms && !nohit[1].ms);
+	}
+	puts("PASS: post-KO maximum profile, both victims, selected players, energy references, gain and no repeated KO tail");
 	puts("PASS: continuous damage response, KO tail, player routing, duplicate-frame/replay/reset/invalid-data suppression");
 }

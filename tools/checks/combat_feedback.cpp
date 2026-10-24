@@ -43,6 +43,8 @@ int main() {
   store(hp[victim],0);
   auto post=tracker.advance(contacts.snapshot(ram,22),3,100);
   assert(post[0].ms && post[1].ms && !post[0].knockout && !post[1].knockout);
+  assert(std::fabs(post[victim].low-0.90f)<0.00001f && post[victim].ms==100);
+  assert(std::fabs(post[victim^1].high-0.90f)<0.00001f && post[victim^1].ms==65);
   // A repeated zero at another writer ends the round preview, never a pulse.
   store(hp[victim],0,0x3fdb4);
   auto replay=tracker.advance(contacts.snapshot(ram,23),3,100);
