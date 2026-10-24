@@ -41,5 +41,29 @@ int main() {
  // Never silently truncate a search: report overflow and arm no watches.
  for(unsigned a=0;a<ram.size();a+=2) put(ram,a,100);
  assert(!p.searches[1].start(ram) && p.searches[1].overflow);p.update_watches();assert(!p.watched());
+ // Preset watches the independently observed fields, not display smoothing.
+ std::fill(ram.begin(),ram.end(),0);
+ put(ram,0x1087d6,72);put(ram,0x10a7d6,47);
+ assert(p.watch_identified_health(ram) && p.watched()==2 && p.size()==0);
+ cpu.s.r[4]=0x1087d6;cpu.s.r[3]=32;cpu.s.pc=0x104bc;p.frame=3191;p.phase=Phase::live;
+ cpu.exec_op((44u<<26)|(3u<<21)|(4u<<16));
+ cpu.s.r[4]=0x10a7d6;cpu.s.r[3]=22;p.frame=6773;
+ cpu.exec_op((44u<<26)|(3u<<21)|(4u<<16));
+ assert(p.size()==2);
+ cpu.s.r[4]=0x10c408;cpu.s.r[3]=40;
+ cpu.exec_op((44u<<26)|(3u<<21)|(4u<<16));assert(p.size()==2);
+ assert(p.save("/tmp/vf3-combat-preset.csv",ram));
+ std::ifstream preset("/tmp/vf3-combat-preset.csv");std::string pcsv((std::istreambuf_iterator<char>(preset)),{});
+ assert(pcsv.find("watched=2; stores=2")!=std::string::npos);
+ assert(pcsv.find("001087d6,1,72,32,2,live")!=std::string::npos);
+ assert(pcsv.find("0010a7d6,2,47,22,2,live")!=std::string::npos);
+ assert(pcsv.find("0010c408")==std::string::npos);
+ p.clear();assert(!p.save("/tmp/vf3-combat-preset.csv",ram));
+ std::ifstream kept("/tmp/vf3-combat-preset.csv");std::string original((std::istreambuf_iterator<char>(kept)),{});
+ assert(original==pcsv);
+ std::remove("/tmp/vf3-combat-preset.csv");
+ std::vector<uint8_t> short_ram(16);assert(!p.watch_identified_health(short_ram));
+ assert(!p.watched() && !p.size());
+ puts("PASS: identified health preset, both victim stores, display exclusion and empty-export preservation");
  puts("PASS: scalar candidate narrowing, guest byte order, actual interpreter 8/16/32/64 stores, ring bounds, CSV and overflow");
 }

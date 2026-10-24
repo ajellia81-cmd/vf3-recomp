@@ -1,8 +1,9 @@
 # Combat haptics: Revision D mapping prerequisite
 
-Personal build 3 adds opt-in scalar discovery and manual vibration tests. Automatic
-combat vibration is still disabled: verified Revision D health fields, a contact
-writer and a live-fight/replay gate are not established yet. Build 2 remains the
+Personal build 4 adds a one-button preset for both independently observed health fields.
+Build 3's scalar discovery and manual vibration tests remain available. Automatic
+combat vibration is still disabled: the normal health writer is observed for both fighters, but post-KO contacts and a
+live-fight/replay gate are not yet established. Build 2 remains the
 previous user-tested gameplay baseline.
 
 The reusable damage tracker, SDL controller routing and Core Haptics phone backend
@@ -97,3 +98,22 @@ false triggers. If the same writer is shared across scenes, an independently
 verified play-state discriminator will still be required; manual labels alone
 cannot supply a production gate. Synthetic tests prove byte handling and bounds,
 not Revision D semantics or physical feedback.
+
+## Build 4: no repeated health search
+
+Complete device captures (6) and (9) show discrete health losses at guest
+0x1087D6 (P1) and 0x10A7D6 (P2), both written by PC 0x104BC. Display smoothing
+uses 0x10A408/0x10C408 at other PCs; those writes must not count as impacts.
+
+Choose Controls > Combat diagnostics > Watch identified health once. This clears
+the earlier capture and watches both discrete fields, even at zero health.
+Do not run another search or clear/reset before exporting. Choose live for actual
+gameplay, post_ko for reproducible extra attacks after KO, replay for on-screen
+replays and outside for other scenes. All labels remain manual observations,
+never a production haptic gate. The preset itself produces no vibration.
+Save hit diagnostics reports store/watch counts and refuses to overwrite an
+existing useful CSV when there is nothing to export.
+
+Capture normal hits and the transition through KO/replay, changing scene labels
+when appropriate. The user never needs to receive attacks after their fighter
+is knocked out. Automatic combat vibration remains disabled pending scene gating.

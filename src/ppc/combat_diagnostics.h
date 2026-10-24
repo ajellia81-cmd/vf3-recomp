@@ -72,6 +72,18 @@ public:
     watches[watch_count++]={c.address,p+1}; first=std::min(first,c.address);last=std::max(last,c.address+2);
    }
  }
+ // Identified independently from both player captures; diagnostic use only.
+ // This is not a live/replay gate and never enables automatic feedback.
+ bool watch_identified_health(const std::vector<uint8_t> &ram) {
+  constexpr uint32_t fields[2]={0x1087d6,0x10a7d6};
+  if(ram.size()<=fields[1]+1)return false;
+  clear();
+  for(unsigned p=0;p<2;++p) {
+   searches[p].started=true;
+   searches[p].candidates.push_back({fields[p],health_word(ram.data(),fields[p])});
+  }
+  update_watches();return true;
+ }
  void observe(const uint8_t *ram,uint32_t a,uint64_t value,unsigned bytes,uint32_t pc) {
   if(!watch_count || a>=last || uint64_t(a)+bytes<=first || uint64_t(a)+bytes>0x800000) return;
   for(size_t i=0;i<watch_count;++i) {
@@ -88,8 +100,11 @@ public:
   }
  }
  bool save(const char *path,const std::vector<uint8_t> &ram) const {
+  // Do not overwrite a useful earlier export with a header-only file.
+  if(!watch_count && !count)return false;
   FILE *f=std::fopen(path,"w"); if(!f) return false;
   std::fprintf(f,"# Unverified scalar health candidates; player/phase are manual labels. No RAM or ROM dump.\n");
+  std::fprintf(f,"# watched=%zu; stores=%zu; labels are manual, not an automatic scene gate.\n",watch_count,count);
   std::fprintf(f,"kind,frame,pc_hex,guest_address_hex,player_label,before,after,store_bytes,phase_label\n");
   for(size_t i=0;i<watch_count;++i) {
    auto w=watches[i];if(w.address+1<ram.size())

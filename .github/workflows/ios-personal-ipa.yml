@@ -1,4 +1,4 @@
-# Personal iOS build 3: warmed haptic test and scalar data discovery excluding the program image.
+# Personal iOS build 4: identified health preset and empty-export guard.
 name: Personal unsigned iOS IPA (Model 3)
 on:
   push:
@@ -109,8 +109,8 @@ jobs:
         run: python3 ios/Scripts/package-personal-ipa.py
       - uses: actions/upload-artifact@v4
         with:
-          name: VirtuaFighter3-build3-${{ github.sha }}
-          path: ios/build/personal/VirtuaFighter3-build3-unsigned.ipa
+          name: VirtuaFighter3-build4-${{ github.sha }}
+          path: ios/build/personal/VirtuaFighter3-build4-unsigned.ipa
           if-no-files-found: error
           retention-days: 3
           compression-level: 0

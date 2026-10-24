@@ -2339,6 +2339,9 @@ static int run_game(int argc, char **argv, bool &quit_application)
    diagnostic_status=q.overflow?"Search overflow; no candidates armed.":!q.started?"Start a search first.":
     "P"+std::to_string(diagnostic_player+1)+": "+std::to_string(q.candidates.size())+" candidates; "+std::to_string(board.combat_probe.watched())+" watched.";
   };
+  pg.items.push_back({"Watch identified health","Clear the old capture and watch both identified fighter health fields. No search needed. Automatic vibration remains off.",{},{},
+   [&]{diagnostic_wait();bool ok=board.combat_probe.watch_identified_health(board.ram);
+    diagnostic_status=ok?"P1 + P2 health watched. Set label and resume.":"Cannot arm identified fields.";menu.refresh();}});
   pg.items.push_back({"Start health search","Before a hit in a fresh round: collect plausible scalar integer fields. Replaces this player's old search.",{},{},
    [&,report_candidates]{diagnostic_wait();board.combat_probe.searches[diagnostic_player].start(board.ram);board.combat_probe.update_watches();report_candidates();menu.refresh();}});
   pg.items.push_back({"Keep decreased values","Resume, let ONLY the selected player take damage, then reopen this menu and select this. Repeat until 8 or fewer remain.",{},{},
@@ -2349,8 +2352,12 @@ static int run_game(int argc, char **argv, bool &quit_application)
    [&]{return std::string(vf3_diagnostics::phase_name(board.combat_probe.phase));},
    [&](int d){diagnostic_wait();auto &phase=board.combat_probe.phase;phase=vf3_diagnostics::Phase((unsigned(phase)+d+5)%5);}});
   pg.items.push_back({"Save hit diagnostics","Save only narrowed candidates and scalar store events to haptics-hit-diagnostics.csv in the app data folder.",{},{},
-   [&]{diagnostic_wait();bool ok=board.combat_probe.save((data+"/haptics-hit-diagnostics.csv").c_str(),board.ram);
-    diagnostic_status=ok?"Saved haptics-hit-diagnostics.csv":"Save failed.";menu.refresh();}});
+   [&]{diagnostic_wait();
+    if(!board.combat_probe.watched() && !board.combat_probe.size()) {
+     diagnostic_status="Nothing recorded. Choose Watch identified health.";menu.refresh();return;
+    }
+    bool ok=board.combat_probe.save((data+"/haptics-hit-diagnostics.csv").c_str(),board.ram);
+    diagnostic_status=ok?"Saved "+std::to_string(board.combat_probe.size())+" stores; "+std::to_string(board.combat_probe.watched())+" watched.":"Save failed.";menu.refresh();}});
   pg.items.push_back({"Clear diagnostics","Disarm all watches and discard this session's scalar observations.",{},{},
    [&]{diagnostic_wait();board.combat_probe.clear();diagnostic_status="Cleared. Start a new health search.";menu.refresh();}});
   pg.items.push_back(back_item());return pg;
