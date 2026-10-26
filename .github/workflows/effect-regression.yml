@@ -1,0 +1,95 @@
+# Compile-only effect regression verification; no IPA packaging or upload.
+name: Smooth-motion effect regression (compile only)
+on:
+  push:
+    branches: [ios-port]
+    paths: ['.github/workflows/effect-regression.yml', 'src/video/r3d_scene.cpp', 'tools/checks/effect_flipbook.cpp']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: vf3-effect-regression-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios:
+    if: github.repository == 'ajellia81-cmd/vf3-recomp'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install project generator
+        run: brew install xcodegen sdl3
+      - name: Identify Apple toolchain
+        id: toolchain
+        run: echo "key=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: dependencies
+        with:
+          path: |
+            ios/Dependencies/*.xcframework
+            ios/build/licenses
+          key: ios-static-${{ runner.os }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('ios/Dependencies/versions.env', 'ios/Scripts/prepare-dependencies.sh', 'ios/Scripts/patch-sdl-haptics.py', 'ios/Scripts/ios_rumble_async.inc') }}
+      - name: Prepare redistributable libraries only
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        run: sh ios/Scripts/prepare-dependencies.sh
+      - uses: actions/cache/save@v4
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ios/Dependencies/*.xcframework
+            ios/build/licenses
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
+      - name: Prepare host-generated opcode tables (no game data)
+        run: sh ios/Scripts/prepare-sources.sh
+      - name: Test actual flipbook particle exclusion without game data
+        run: |
+          mkdir -p ios/build
+          xcrun clang++ -std=c++20 -O2 -ffunction-sections -fdata-sections tools/checks/effect_flipbook.cpp -Wl,-dead_strip -o ios/build/effect-flipbook
+          ios/build/effect-flipbook
+      - name: Test interpreter boundary, GPU and display without game data
+        run: |
+          mkdir -p ios/build
+          xcrun clang++ -std=c++20 -O3 -ffp-contract=off -DVF3_IOS=1 -DVF3_DISABLE_JIT=1 tools/checks/ios_runtime.cpp src/ppc/ppc.cpp src/rec/ppc_rec_stub.cpp src/machine/romset.cpp -lz -o ios/build/ios-runtime
+          ios/build/ios-runtime
+          for optimization in s 3; do
+            xcrun clang++ -std=c++20 -O$optimization -ffp-contract=off -DVF3_IOS=1 -DVF3_DISABLE_JIT=1 tools/checks/interpreter_workload.cpp src/ppc/ppc.cpp -o ios/build/interpreter-$optimization
+            ios/build/interpreter-$optimization > ios/build/interpreter-$optimization.state
+          done
+          diff -u ios/build/interpreter-s.state ios/build/interpreter-3.state
+          cat ios/build/interpreter-3.state
+          xcrun clang++ -std=c++20 -O3 -fsanitize=address,undefined tools/checks/texture_rows.cpp -o ios/build/texture-rows
+          ios/build/texture-rows
+          xcrun clang++ -std=c++20 -O2 -I"$(brew --prefix sdl3)/include" tools/checks/controls_config.cpp -L"$(brew --prefix sdl3)/lib" -lSDL3 -o ios/build/controls-config
+          ios/build/controls-config
+          xcrun clang++ -std=c++20 -O2 tools/checks/autosave.cpp -o ios/build/autosave-check
+          ios/build/autosave-check
+          xcrun clang++ -std=c++20 -O3 -ffp-contract=off -I"$(brew --prefix sdl3)/include" tools/checks/display_gpu.cpp src/gpu/r3d_gpu.cpp src/video/r3d_raster.cpp src/video/r3d_scene.cpp -L"$(brew --prefix sdl3)/lib" -lSDL3 -o ios/build/display-gpu
+          ios/build/display-gpu
+      - name: Test automatic round feedback and asynchronous vibration without game data
+        run: |
+          xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror -DVF3_IOS=1 -DVF3_DISABLE_JIT=1 -fsanitize=address,undefined tools/checks/combat_feedback.cpp src/ppc/ppc.cpp -o ios/build/combat-feedback
+          ios/build/combat-feedback
+          xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror tools/checks/fight_haptics.cpp -o ios/build/fight-haptics
+          ios/build/fight-haptics
+          xcrun clang -fobjc-arc -fblocks tools/checks/ios_rumble_async.m -framework Foundation -o ios/build/rumble-async
+          ios/build/rumble-async
+      - name: Generate and verify interpreter-only project
+        run: |
+          sh ios/Scripts/preflight.sh
+          python3 ios/Scripts/prepare-app-icon.py
+          xcodegen generate --spec ios/project.yml
+          python3 ios/Scripts/verify-project.py
+      - name: Verify touch Menu transitions without game data
+        run: |
+          xcrun clang++ -std=c++20 -O2 -I"$(brew --prefix sdl3)/include" tools/checks/touch_menu.cpp -o ios/build/touch-menu
+          ios/build/touch-menu
+      - name: Compile unsigned iPhone app
+        run: |
+          xcodebuild -project ios/VF3Recomp.xcodeproj -scheme VF3Recomp \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/build/device CODE_SIGNING_ALLOWED=NO build > ios/build/device.log 2>&1 || {
+              grep -n -m 40 'error:' ios/build/device.log || true
+              tail -80 ios/build/device.log; exit 1;
+            }

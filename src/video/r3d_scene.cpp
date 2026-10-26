@@ -860,6 +860,9 @@ void apply_flips(const Scene &b, float t, Scene &out)
 	for (size_t v = 0; v < out.viewports.size() && v < plan.flips.size(); v++)
 		for (size_t j = 0; j < out.viewports[v].models.size() && j < plan.flips[v].size(); j++) {
 			const Flip &f = plan.flips[v][j];
+			// A particle or snapped model must not be re-blended by this later pass.
+			if (v >= plan.from.size() || j >= plan.from[v].size() || plan.from[v][j] < 0 ||
+			    (v < plan.swarm.size() && j < plan.swarm[v].size() && plan.swarm[v][j])) continue;
 			if (f.age < 0 || f.period <= 0) continue;
 			const float w = (float(f.age) + t) / float(f.period);   // (the newer step's share)
 			if (w >= 1) continue;
@@ -1353,14 +1356,14 @@ bool interpolate(const Scene &a, const Scene &b, float t, Scene &out, InterpStat
 	// the flipbooks: a step from a to b remembered, or the one remembered for a's model carried on (when a's frame
 	// was the last plan's b: one frame on)
 	{
-		const bool chain = plan.b == a.id && a.id && plan.flips.size() == a.viewports.size();
+		const bool chain = np.ok && plan.ok && plan.b == a.id && a.id && plan.flips.size() == a.viewports.size();
 		const std::vector<int> &av = np.av;
 		np.flips.resize(np.paired.size());
 		for (size_t v = 0; v < np.paired.size(); v++) {
 			np.flips[v].resize(np.paired[v].size());
 			for (size_t j = 0; j < np.paired[v].size(); j++) {
 				const int i = np.paired[v][j];
-				if (i < 0) continue;
+				if (!np.ok || i < 0 || np.from[v][j] < 0 || np.swarm[v][j]) continue;
 				const size_t u = size_t(av[v]);   // (paired: in a viewport of a's)
 				const Flip *pr = chain && size_t(i) < plan.flips[u].size() && plan.flips[u][size_t(i)].age >= 0 ? &plan.flips[u][size_t(i)] : nullptr;
 				Flip &f = np.flips[v][j];
