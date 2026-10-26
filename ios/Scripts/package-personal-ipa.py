@@ -17,7 +17,7 @@ assert info['CFBundleIdentifier'] == 'com.ajellia81.vf3recomp'
 assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
 assert info.get('CADisableMinimumFrameDurationOnPhone') is True
 assert info['CFBundleDisplayName'] == 'Virtua Fighter 3'
-assert info['CFBundleVersion'] == '7'
+assert info['CFBundleVersion'] == '8'
 assert info['CFBundleIcons']['CFBundlePrimaryIcon']['CFBundleIconName'] == 'AppIcon'
 assert (app / 'Assets.car').is_file()
 exe = app / info['CFBundleExecutable']
@@ -65,7 +65,7 @@ sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True)
     'signed': False, 'roms_included': False, 'purpose': 'personal use; re-sign before installation',
     'gameplay_device_tested': False, 'automatic_combat_haptics': True, 'manual_round_contact_preview': False, 'post_ko_contact_profile': 'maximum ordinary impact; obey overall gain; no KO tail', 'automatic_live_demo_gate_verified': False, 'combat_diagnostics': False, 'round_activation': 'verified full-health refill pair',
 }, indent=2) + '\n')
-ipa = out / 'VirtuaFighter3-build7-clean-unsigned.ipa'
+ipa = out / 'VirtuaFighter3-build8-clean-unsigned.ipa'
 subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', 'Payload', ipa.name], cwd=out, check=True)
 with zipfile.ZipFile(ipa) as z:
     assert z.testzip() is None
